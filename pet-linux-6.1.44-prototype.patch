@@ -367,8 +367,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/mre
  
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet.c linux-6.1.44-pet/mm/pet.c
 --- linux-6.1.44-clean/mm/pet.c	1969-12-31 16:00:00
-+++ linux-6.1.44-pet/mm/pet.c	2026-07-12 07:59:27
-@@ -0,0 +1,2576 @@
++++ linux-6.1.44-pet/mm/pet.c	2026-07-12 09:02:32
+@@ -0,0 +1,2603 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * PET proactive demotion prototype.
@@ -1118,6 +1118,15 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +				protected = restored < 0 ? restored :
 +					pet_update_canary_protection_locked(new_pb,
 +									    true);
++				/*
++				 * Defensive only: both walks run under the
++				 * mremap-held mmap write lock and their
++				 * callbacks cannot fail, so this branch is
++				 * unreachable today.  If a future change
++				 * makes it live, note that clearing
++				 * canaries_installed here would orphan any
++				 * demoted canary pages of this seed.
++				 */
 +				if (restored < 0 || protected < 0) {
 +					new_pb->state = PET_NORMAL;
 +					new_pb->canaries_installed = false;
@@ -2070,7 +2079,12 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	return READ_ONCE(pet_file_demote_enabled) && pet_file_trackable(file);
 +}
 +
-+static void pet_queue_cold_inode_locked(struct inode *inode, bool ref_held)
++/*
++ * Takes its own inode reference when it queues; the early returns make a
++ * "caller passes ownership" variant unimplementable, so no such parameter
++ * exists.
++ */
++static void pet_queue_cold_inode_locked(struct inode *inode)
 +{
 +	/*
 +	 * Recheck the switches here, under the same pet_cold_lock they are
@@ -2082,8 +2096,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		return;
 +	if (inode->i_pet_cold_queued || inode->i_pet_cold_processing)
 +		return;
-+	if (!ref_held)
-+		ihold(inode);
++	ihold(inode);
 +	inode->i_pet_cold_queued = true;
 +	inode->i_pet_cold_jiffies = jiffies;
 +	list_add_tail(&inode->i_pet_cold_list, &pet_cold_files);
@@ -2129,7 +2142,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	    READ_ONCE(pet_enabled) && pet_file_eligible(file) &&
 +	    !inode->i_pet_cold_queued && !inode->i_pet_cold_processing) {
 +		inode->i_pet_cold_retries = 0;
-+		pet_queue_cold_inode_locked(inode, false);
++		pet_queue_cold_inode_locked(inode);
 +	}
 +	spin_unlock(&pet_cold_lock);
 +}
@@ -2362,7 +2375,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +				requeue = false;
 +		}
 +		if (requeue)
-+			pet_queue_cold_inode_locked(inode, false);
++			pet_queue_cold_inode_locked(inode);
 +		/* Account our reference as detached until the iput below. */
 +		pet_cold_detached++;
 +		spin_unlock(&pet_cold_lock);
@@ -2514,12 +2527,26 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	if (pet_remove_canaries(pb))
 +		goto fail;
 +
++	/*
++	 * Canaries are installed before the children are published below,
++	 * so a fault in this window resolves against the (now canary-less)
++	 * parent and falls to do_numa_page(): one lost count, re-poisoned
++	 * by the next refresh tick.  Accepted; publishing first would need
++	 * per-child ref/lock churn against concurrent munmap.
++	 */
 +	list_for_each_entry(new, &new_blocks, list) {
 +		if (new->state != PET_DEMOTED)
 +			continue;
 +		if (pet_install_canaries(new)) {
-+			pet_migrate_range(new->mm, new->start, new->end,
-+					  false, NULL, false);
++			/*
++			 * Clearing canaries_installed is only safe once the
++			 * whole range (including any pre-demoted canary
++			 * pages) is back on the fast tier; otherwise keep
++			 * the seed so a later install can find them.
++			 */
++			if (pet_migrate_range(new->mm, new->start, new->end,
++					      false, NULL, false) >= 0)
++				new->canaries_installed = false;
 +			new->state = PET_NORMAL;
 +			pet_reset_tracking(new);
 +		}
