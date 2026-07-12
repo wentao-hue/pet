@@ -38,7 +38,11 @@ Primary artifacts:
   including full-VMA gap filling for small expansions.
 - `mremap()` movement preserves PET P-block state, tracking bitmaps, fake-fault
   counters, and canary protection metadata before the old range is released.
-- Reopen-safe cold-file demotion with processing generations.
+- Reopen-safe cold-file demotion with processing generations; folios already
+  on their target node are skipped (an already-demoted file no longer fails
+  migration and requeues forever), and inodes whose pages were skipped only
+  for dirty/writeback are requeued so freshly written files are demoted
+  after writeback instead of being forgotten.
 - Runtime `file_demote_enabled=0` (and `enabled=0`, via proc or sysfs) drains
   queued cold-file inode references.
 - `generic_shutdown_super()` drains per-superblock cold-file queue and waits
@@ -72,10 +76,13 @@ python3 pet_repro/run_synthetic_phase_shift.py > /tmp/pet_phase_shift.csv
   page walks/migration do not run under the global PET list mutex; file
   open/close accounting uses a dedicated spinlock and the fault path skips
   PET entirely while no canaries exist.
-- Run experiments with `kernel.numa_balancing=0`: PET reuses the PROT_NONE
-  encoding of NUMA hint faults, so active balancing miscounts canary faults
-  and pays the PET fault-path cost on every hint fault.  Enabling PET while
-  balancing is on logs a warning.
+- `CONFIG_NUMA_BALANCING` is a hard build dependency (enforced in Kconfig):
+  without it, x86 `pte_protnone()` is stubbed to 0, so canary faults would
+  loop forever in the access-flags path and canary removal would silently
+  skip every PTE.  At runtime, however, set `kernel.numa_balancing=0`: PET
+  reuses the PROT_NONE encoding of NUMA hint faults, so active balancing
+  miscounts canary faults and pays the PET fault-path cost on every hint
+  fault.  Enabling PET while balancing is on logs a warning.
 - With THP on, 6.1.44 khugepaged does not skip PROT_NONE PTEs: collapse can
   absorb canaries and the next refresh re-splits that PMD.  Defer or disable
   khugepaged for THP experiments, or acknowledge the split/collapse churn.

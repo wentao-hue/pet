@@ -191,14 +191,14 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/includ
 +#endif /* _LINUX_PET_H */
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/Kconfig linux-6.1.44-pet/mm/Kconfig
 --- linux-6.1.44-clean/mm/Kconfig	2023-08-08 11:03:51
-+++ linux-6.1.44-pet/mm/Kconfig	2026-07-10 03:45:36
-@@ -1154,6 +1154,20 @@
++++ linux-6.1.44-pet/mm/Kconfig	2026-07-12 07:16:39
+@@ -1154,6 +1154,24 @@
  	bool
  	depends on !STACK_GROWSUP
  
 +config PET_TIERING
 +	bool "PET proactive demotion prototype"
-+	depends on X86_64 && MMU && NUMA && MIGRATION
++	depends on X86_64 && MMU && NUMA && NUMA_BALANCING && MIGRATION
 +	help
 +	  Enable a prototype implementation of PET (Proactive Demotion for
 +	  Efficient Tiered Memory Management).  PET captures anonymous mmap()
@@ -206,6 +206,10 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/Kco
 +	  PROT_NONE canary faults for PHASE2/DEMOTED P-blocks, proactively
 +	  demotes cold P-blocks and cold file pages, and promotes re-accessed
 +	  demoted P-blocks with a background kpromoted thread.
++
++	  PET reuses the NUMA-balancing PROT_NONE PTE encoding for its canary
++	  pages, so NUMA_BALANCING must be built in; disable it at runtime
++	  (kernel.numa_balancing=0) while PET experiments run.
 +
 +	  This is an experimental reconstruction of the EuroSys 2025 PET paper,
 +	  intended for research reproduction rather than production use.
@@ -361,8 +365,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/mre
  
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet.c linux-6.1.44-pet/mm/pet.c
 --- linux-6.1.44-clean/mm/pet.c	1969-12-31 16:00:00
-+++ linux-6.1.44-pet/mm/pet.c	2026-07-12 04:28:07
-@@ -0,0 +1,2479 @@
++++ linux-6.1.44-pet/mm/pet.c	2026-07-12 07:20:38
+@@ -0,0 +1,2507 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * PET proactive demotion prototype.
@@ -398,6 +402,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +#include <linux/sched/sysctl.h>
 +#include <linux/seq_file.h>
 +#include <linux/spinlock.h>
++#include <linux/swapops.h>
 +#include <linux/uaccess.h>
 +#include <linux/wait.h>
 +
@@ -436,7 +441,6 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	unsigned long sample_addr;
 +	unsigned long *temp_sample_addr;
 +	unsigned long *temp_accessed;
-+	unsigned long *temp_canary_installed;
 +	u32 canary_seed;
 +	unsigned long fault_count;
 +	u64 fault_window;
@@ -712,7 +716,6 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +static void pet_destroy_pblock(struct pet_pblock *pb)
 +{
 +	bitmap_free(pb->temp_accessed);
-+	bitmap_free(pb->temp_canary_installed);
 +	kfree(pb->temp_sample_addr);
 +	kfree(pb);
 +	atomic64_inc(&pet_stats.released_pblocks);
@@ -763,35 +766,24 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	unsigned long temp = pet_temp_bytes();
 +	unsigned long len = pb->end - pb->start;
 +	unsigned int nr = max_t(unsigned int, DIV_ROUND_UP(len, temp), 1);
-+	bool had_canaries = pb->canaries_installed;
 +
-+	if (pb->temp_accessed && pb->temp_canary_installed &&
-+	    pb->temp_sample_addr && pb->nr_temp == nr)
++	if (pb->temp_accessed && pb->temp_sample_addr && pb->nr_temp == nr)
 +		return 0;
 +
 +	bitmap_free(pb->temp_accessed);
-+	bitmap_free(pb->temp_canary_installed);
 +	kfree(pb->temp_sample_addr);
 +	pb->temp_accessed = bitmap_zalloc(nr, GFP_KERNEL);
-+	pb->temp_canary_installed = bitmap_zalloc(nr, GFP_KERNEL);
 +	pb->temp_sample_addr = kcalloc(nr, sizeof(*pb->temp_sample_addr),
 +				       GFP_KERNEL);
-+	if (!pb->temp_accessed || !pb->temp_canary_installed ||
-+	    !pb->temp_sample_addr) {
++	if (!pb->temp_accessed || !pb->temp_sample_addr) {
 +		bitmap_free(pb->temp_accessed);
-+		bitmap_free(pb->temp_canary_installed);
 +		kfree(pb->temp_sample_addr);
 +		pb->temp_accessed = NULL;
-+		pb->temp_canary_installed = NULL;
 +		pb->temp_sample_addr = NULL;
 +		pb->nr_temp = 0;
 +		return -ENOMEM;
 +	}
 +	pb->nr_temp = nr;
-+	if (had_canaries)
-+		bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
-+	else
-+		bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
 +	return 0;
 +}
 +
@@ -812,10 +804,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	pb->fault_window = pet_current_fault_window();
 +	pb->sample_addr = 0;
 +	bitmap_free(pb->temp_accessed);
-+	bitmap_free(pb->temp_canary_installed);
 +	kfree(pb->temp_sample_addr);
 +	pb->temp_accessed = NULL;
-+	pb->temp_canary_installed = NULL;
 +	pb->temp_sample_addr = NULL;
 +	pb->nr_temp = 0;
 +	if (pb->state != PET_NORMAL || pb->canaries_installed)
@@ -917,27 +907,16 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	pb->id = atomic64_inc_return(&pet_next_id);
 +
 +	if (pb->state != PET_NORMAL || pb->canaries_installed ||
-+	    src->temp_accessed || src->temp_canary_installed) {
++	    src->temp_accessed) {
 +		if (pet_prepare_temp(pb)) {
-+			bitmap_free(pb->temp_accessed);
-+			bitmap_free(pb->temp_canary_installed);
 +			kfree(pb);
 +			return NULL;
 +		}
 +		if (pb->temp_accessed)
 +			bitmap_zero(pb->temp_accessed, pb->nr_temp);
-+		if (pb->temp_canary_installed)
-+			bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
 +		pet_copy_mremap_temp_bitmap(src, pb, old_start, old_end,
 +					    new_start, src->temp_accessed,
 +					    pb->temp_accessed);
-+		pet_copy_mremap_temp_bitmap(src, pb, old_start, old_end,
-+					    new_start,
-+					    src->temp_canary_installed,
-+					    pb->temp_canary_installed);
-+		if (pb->canaries_installed && pb->temp_canary_installed &&
-+		    !src->temp_canary_installed)
-+			bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
 +	}
 +
 +	atomic64_inc(&pet_stats.captured_pblocks);
@@ -1234,6 +1213,12 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	ctx->present = true;
 +	if (ptep_test_and_clear_young(walk->vma, addr, pte))
 +		ctx->accessed = true;
++	/*
++	 * Like DAMON, skip the TLB flush (a stale young bit only biases one
++	 * sample) but do age secondary MMUs so KVM guest accesses are seen.
++	 */
++	if (mmu_notifier_clear_young(walk->mm, addr, addr + PAGE_SIZE))
++		ctx->accessed = true;
 +	if (test_and_clear_page_young(page))
 +		ctx->accessed = true;
 +	return 0;
@@ -1261,6 +1246,9 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		goto out;
 +	ctx->present = true;
 +	if (pmdp_test_and_clear_young(walk->vma, addr & HPAGE_PMD_MASK, pmd))
++		ctx->accessed = true;
++	if (mmu_notifier_clear_young(walk->mm, addr & HPAGE_PMD_MASK,
++				     (addr & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE))
 +		ctx->accessed = true;
 +	if (test_and_clear_page_young(page))
 +		ctx->accessed = true;
@@ -1335,7 +1323,9 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 +	struct pet_protect_ctx *ctx = walk->private;
 +
-+	if (!ctx->protect && pmd_trans_huge(*pmd))
++	/* is_swap_pmd(): don't split a THP that is mid-migration either. */
++	if (!ctx->protect &&
++	    (pmd_trans_huge(*pmd) || is_swap_pmd(*pmd)))
 +		walk->action = ACTION_CONTINUE;
 +#endif
 +	return 0;
@@ -1386,7 +1376,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +					struct mm_walk *walk)
 +{
 +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-+	if (pmd_trans_huge(*pmd))
++	if (pmd_trans_huge(*pmd) || is_swap_pmd(*pmd))
 +		walk->action = ACTION_CONTINUE;
 +#endif
 +	return 0;
@@ -1475,9 +1465,15 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		return -ENOMEM;
 +	if (!pb->canaries_installed) {
 +		pb->canary_seed = get_random_u32();
-+		bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
 +		pb->canaries_installed = true;
 +		selected = true;
++		/*
++		 * Raise the fast-path flag before any PTE is poisoned so a
++		 * fault on a fresh canary cannot slip past the
++		 * pet_have_poisoned check while installation is in flight.
++		 * On failure the flag stays until the next rescan (safe).
++		 */
++		pet_note_poisoned();
 +	}
 +	migrated = pet_migrate_range(pb->mm, pb->start, pb->end, true, pb, true);
 +	if (migrated < 0)
@@ -1486,15 +1482,11 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	if (changed < 0)
 +		goto fail;
 +	atomic64_add(changed, &pet_stats.canary_pages);
-+	pet_note_poisoned();
 +	return 0;
 +
 +fail:
-+	if (selected) {
++	if (selected)
 +		pb->canaries_installed = false;
-+		if (pb->temp_canary_installed)
-+			bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
-+	}
 +	return migrated < 0 ? migrated : changed;
 +}
 +
@@ -1508,8 +1500,6 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	if (changed < 0)
 +		return changed;
 +	pb->canaries_installed = false;
-+	if (pb->temp_canary_installed)
-+		bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
 +	return 0;
 +}
 +
@@ -1926,7 +1916,13 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	}
 +}
 +
-+static bool pet_restore_canary_fault_pte(struct vm_fault *vmf)
++/*
++ * @restored is set only when this thread actually rewrote the PTE; a
++ * pte_same() race means another thread already handled the fault, and
++ * counting it again would double-book the same canary access.
++ */
++static bool pet_restore_canary_fault_pte(struct vm_fault *vmf,
++					 bool *restored)
 +{
 +	struct vm_area_struct *vma = vmf->vma;
 +	struct mmu_notifier_range range;
@@ -1934,6 +1930,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	bool was_writable;
 +	bool handled = false;
 +
++	*restored = false;
 +	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0, vma,
 +				vma->vm_mm, vmf->address,
 +				vmf->address + PAGE_SIZE);
@@ -1957,6 +1954,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +				old_pte, new_pte);
 +	update_mmu_cache(vma, vmf->address, vmf->pte);
 +	handled = true;
++	*restored = true;
 +out:
 +	pte_unmap_unlock(vmf->pte, vmf->ptl);
 +	mmu_notifier_invalidate_range_end(&range);
@@ -1968,6 +1966,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	struct pet_pblock *pb;
 +	unsigned int temp_idx;
 +	bool handled;
++	bool restored = false;
 +
 +	if (!READ_ONCE(pet_enabled))
 +		return false;
@@ -1997,8 +1996,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		return false;
 +	}
 +
-+	handled = pet_restore_canary_fault_pte(vmf);
-+	if (handled && !READ_ONCE(pb->dying)) {
++	handled = pet_restore_canary_fault_pte(vmf, &restored);
++	if (handled && restored && !READ_ONCE(pb->dying)) {
 +		temp_idx = pet_temp_index(pb, vmf->address);
 +		if (pb->temp_accessed && temp_idx < pb->nr_temp)
 +			__set_bit(temp_idx, pb->temp_accessed);
@@ -2098,7 +2097,13 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	spin_unlock(&pet_cold_lock);
 +}
 +
-+static long pet_migrate_file_inode(struct inode *inode, bool demote)
++/*
++ * @dirty_skipped (may be NULL): set when clean migration candidates were
++ * skipped only because they were dirty or under writeback, so the caller
++ * can retry after writeback instead of dropping the inode for good.
++ */
++static long pet_migrate_file_inode(struct inode *inode, bool demote,
++				   bool *dirty_skipped)
 +{
 +	struct address_space *mapping = inode->i_mapping;
 +	struct pet_alloc_ctx alloc = {
@@ -2118,10 +2123,24 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	while (filemap_get_folios(mapping, &index, (pgoff_t)-1, &fbatch)) {
 +		for (i = 0; i < folio_batch_count(&fbatch); i++) {
 +			struct folio *folio = fbatch.folios[i];
++			int target;
 +
 +			if (folio_test_dirty(folio) ||
-+			    folio_test_writeback(folio) ||
-+			    folio_test_unevictable(folio))
++			    folio_test_writeback(folio)) {
++				if (dirty_skipped)
++					*dirty_skipped = true;
++				continue;
++			}
++			if (folio_test_unevictable(folio))
++				continue;
++			/*
++			 * Skip folios that are already where they belong;
++			 * otherwise an already-demoted file fails migration
++			 * forever and is requeued every scan.
++			 */
++			target = pet_choose_target_node(&folio->page, demote);
++			if (target == NUMA_NO_NODE ||
++			    target == folio_nid(folio))
 +				continue;
 +			if (folio_isolate_lru(folio))
 +				continue;
@@ -2184,9 +2203,16 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		spin_lock(&pet_cold_lock);
 +		list_del_init(&inode->i_pet_cold_list);
 +		inode->i_pet_cold_processing = false;
-+		pet_cold_detached--;
 +		spin_unlock(&pet_cold_lock);
 +		iput(inode);
++		/*
++		 * Decrement only after iput(): the reference must stay
++		 * visible to pet_sb_shutdown() until it is actually gone,
++		 * or umount could proceed while we still hold the inode.
++		 */
++		spin_lock(&pet_cold_lock);
++		pet_cold_detached--;
++		spin_unlock(&pet_cold_lock);
 +	}
 +}
 +
@@ -2237,13 +2263,14 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		bool promote_back = false;
 +		bool raced;
 +		bool requeue = false;
++		bool dirty_skipped = false;
 +
 +		inode = pet_get_cold_inode(min_age, &gen, &drop);
 +		pet_put_inode_list(&drop);
 +		if (!inode)
 +			return;
 +
-+		migrated = pet_migrate_file_inode(inode, true);
++		migrated = pet_migrate_file_inode(inode, true, &dirty_skipped);
 +
 +		spin_lock(&pet_cold_lock);
 +		closed_now = atomic_read(&inode->i_pet_open_count) == 0 &&
@@ -2252,7 +2279,12 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		raced = inode->i_pet_cold_gen != gen || !closed_now;
 +		if (migrated > 0 && raced)
 +			promote_back = true;
-+		if (closed_now && (migrated < 0 || raced))
++		/*
++		 * Retry after writeback finishes (dirty_skipped), otherwise a
++		 * freshly written file demotes nothing on its only pass and
++		 * is forgotten until the next open/close cycle.
++		 */
++		if (closed_now && (migrated < 0 || raced || dirty_skipped))
 +			requeue = true;
 +		spin_unlock(&pet_cold_lock);
 +
@@ -2262,7 +2294,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		 * reference we still hold.
 +		 */
 +		if (promote_back)
-+			pet_migrate_file_inode(inode, false);
++			pet_migrate_file_inode(inode, false, NULL);
 +
 +		spin_lock(&pet_cold_lock);
 +		list_del_init(&inode->i_pet_cold_list);
