@@ -15,13 +15,31 @@ PHASES="${PHASES:-30}"
 mkdir -p "$OUT_DIR"
 cc -O2 -pthread "$SRC" -o "$BIN"
 
-if [[ -w /proc/pet/enabled ]]; then
-  echo 1 > /proc/pet/enabled
+PET_ENABLE="${PET_ENABLE:-1}"
+PET_ENABLED_PREV=""
+if [[ "$PET_ENABLE" == "1" ]]; then
+  if [[ -w /proc/pet/enabled ]]; then
+    PET_ENABLED_PREV="$(cat /proc/pet/enabled)"
+    echo 1 > /proc/pet/enabled
+    # Restore the previous setting even if the benchmark fails.
+    trap '[[ -n "$PET_ENABLED_PREV" ]] && echo "$PET_ENABLED_PREV" > /proc/pet/enabled' EXIT
+  else
+    echo "ERROR: PET_ENABLE=1 but /proc/pet/enabled is not writable" >&2
+    echo "       (PET kernel booted? running as root?)" >&2
+    exit 1
+  fi
 fi
 
 if [[ -r /proc/pet/stats ]]; then
   cat /proc/pet/stats > "$OUT_DIR/pet_stats.before"
 fi
+{
+  echo "TOTAL_GB=$TOTAL_GB HOT_GB=$HOT_GB THREADS=$THREADS"
+  echo "PHASE_SEC=$PHASE_SEC PHASES=$PHASES PET_ENABLE=$PET_ENABLE"
+  for p in /sys/module/pet/parameters/*; do
+    [[ -r "$p" ]] && echo "$(basename "$p")=$(cat "$p")"
+  done
+} > "$OUT_DIR/run_params.txt" 2>/dev/null || true
 
 "$BIN" \
   --total-gb "$TOTAL_GB" \

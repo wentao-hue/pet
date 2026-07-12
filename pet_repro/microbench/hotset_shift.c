@@ -11,6 +11,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,16 +35,17 @@ struct bench_cfg {
 	unsigned int phases;
 };
 
+/* Cacheline-aligned so per-worker byte counters do not false-share. */
 struct worker {
 	pthread_t thread;
 	struct bench_cfg *cfg;
 	uint8_t *base;
 	unsigned int id;
 	uint64_t seed;
-	volatile unsigned int *phase;
-	volatile bool *stop;
-	uint64_t bytes;
-};
+	_Atomic unsigned int *phase;
+	atomic_bool *stop;
+	_Atomic uint64_t bytes;
+} __attribute__((aligned(CACHELINE)));
 
 static uint64_t now_ns(void)
 {
@@ -71,9 +73,11 @@ static void *worker_fn(void *arg)
 	size_t lines_per_hot = cfg->hot_bytes / CACHELINE;
 	size_t total_hot_sets = cfg->total_bytes / cfg->hot_bytes;
 	uint64_t seed = w->seed;
+	uint64_t bytes = 0;
 
-	while (!*w->stop) {
-		unsigned int phase = *w->phase;
+	while (!atomic_load_explicit(w->stop, memory_order_relaxed)) {
+		unsigned int phase = atomic_load_explicit(w->phase,
+							  memory_order_relaxed);
 		size_t set = (phase * cfg->threads + w->id) % total_hot_sets;
 		size_t base_off = set * cfg->hot_bytes;
 		size_t line = xorshift64(&seed) % lines_per_hot;
@@ -82,7 +86,9 @@ static void *worker_fn(void *arg)
 		ptr = (volatile uint64_t *)(w->base + base_off +
 					    line * CACHELINE);
 		*ptr += 1;
-		w->bytes += CACHELINE;
+		bytes += CACHELINE;
+		/* Single writer: a relaxed store is enough for the reader. */
+		atomic_store_explicit(&w->bytes, bytes, memory_order_relaxed);
 	}
 	w->seed = seed;
 	return NULL;
@@ -120,8 +126,8 @@ int main(int argc, char **argv)
 		.phases = 8,
 	};
 	struct worker *workers;
-	volatile unsigned int phase = 0;
-	volatile bool stop = false;
+	_Atomic unsigned int phase = 0;
+	atomic_bool stop = false;
 	uint8_t *base;
 	unsigned int i;
 
@@ -143,8 +149,20 @@ int main(int argc, char **argv)
 	}
 
 	if (!cfg.threads || !cfg.hot_bytes || cfg.total_bytes < cfg.hot_bytes ||
-	    cfg.total_bytes / cfg.hot_bytes < cfg.threads) {
+	    cfg.total_bytes / cfg.hot_bytes < cfg.threads ||
+	    cfg.total_bytes / GIB > (1UL << 20)) {
 		fprintf(stderr, "invalid geometry\n");
+		return 2;
+	}
+	/*
+	 * set = (phase * threads + id) % total_hot_sets shifts by `threads`
+	 * sets per phase; if total_hot_sets divides threads the hot set
+	 * never moves and the run silently measures a static workload.
+	 */
+	if (cfg.phases > 1 &&
+	    cfg.threads % (cfg.total_bytes / cfg.hot_bytes) == 0) {
+		fprintf(stderr,
+			"hot sets would never shift: need total-gb > hot-gb * threads\n");
 		return 2;
 	}
 
@@ -175,7 +193,7 @@ int main(int argc, char **argv)
 		}
 	}
 
-	printf("second,phase,throughput_gbps\n");
+	printf("second,phase,throughput_gbytes_per_sec\n");
 	for (i = 0; i < cfg.phases; i++) {
 		uint64_t before = 0;
 		uint64_t after = 0;
@@ -183,19 +201,21 @@ int main(int argc, char **argv)
 		unsigned int t;
 
 		for (t = 0; t < cfg.threads; t++)
-			before += workers[t].bytes;
-		phase = i;
+			before += atomic_load_explicit(&workers[t].bytes,
+						       memory_order_relaxed);
+		atomic_store_explicit(&phase, i, memory_order_relaxed);
 		start = now_ns();
 		sleep(cfg.phase_sec);
 		for (t = 0; t < cfg.threads; t++)
-			after += workers[t].bytes;
+			after += atomic_load_explicit(&workers[t].bytes,
+						      memory_order_relaxed);
 		printf("%u,%u,%.6f\n", (i + 1) * cfg.phase_sec, i,
 		       (double)(after - before) /
 			       ((double)(now_ns() - start) / 1e9) / 1e9);
 		fflush(stdout);
 	}
 
-	stop = true;
+	atomic_store_explicit(&stop, true, memory_order_relaxed);
 	for (i = 0; i < cfg.threads; i++)
 		pthread_join(workers[i].thread, NULL);
 

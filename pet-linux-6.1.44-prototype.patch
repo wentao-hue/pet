@@ -27,8 +27,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/fil
  		dissolve_on_fput(mnt);
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/inode.c linux-6.1.44-pet/fs/inode.c
 --- linux-6.1.44-clean/fs/inode.c	2023-08-08 11:03:51
-+++ linux-6.1.44-pet/fs/inode.c	2026-07-11 02:23:23
-@@ -199,6 +199,14 @@
++++ linux-6.1.44-pet/fs/inode.c	2026-07-12 07:57:28
+@@ -199,6 +199,15 @@
  	lockdep_set_class(&inode->i_rwsem, &sb->s_type->i_mutex_key);
  
  	atomic_set(&inode->i_dio_count, 0);
@@ -37,6 +37,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/ino
 +	INIT_LIST_HEAD(&inode->i_pet_cold_list);
 +	inode->i_pet_cold_queued = false;
 +	inode->i_pet_cold_processing = false;
++	inode->i_pet_cold_retries = 0;
 +	inode->i_pet_cold_jiffies = 0;
 +	inode->i_pet_cold_gen = 0;
 +#endif
@@ -88,8 +89,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/sup
  		evict_inodes(sb);
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/include/linux/fs.h linux-6.1.44-pet/include/linux/fs.h
 --- linux-6.1.44-clean/include/linux/fs.h	2023-08-08 11:03:51
-+++ linux-6.1.44-pet/include/linux/fs.h	2026-07-11 02:23:23
-@@ -670,6 +670,14 @@
++++ linux-6.1.44-pet/include/linux/fs.h	2026-07-12 07:57:12
+@@ -670,6 +670,15 @@
  #if defined(CONFIG_IMA) || defined(CONFIG_FILE_LOCKING)
  	atomic_t		i_readcount; /* struct files open RO */
  #endif
@@ -98,13 +99,14 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/includ
 +	struct list_head	i_pet_cold_list;
 +	bool			i_pet_cold_queued;
 +	bool			i_pet_cold_processing;
++	unsigned char		i_pet_cold_retries;
 +	unsigned long		i_pet_cold_jiffies;
 +	unsigned long		i_pet_cold_gen;
 +#endif
  	union {
  		const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
  		void (*free_inode)(struct inode *);
-@@ -972,6 +980,9 @@
+@@ -972,6 +981,9 @@
  	/* Used by fs/eventpoll.c to link all the hooks to this file */
  	struct hlist_head	*f_ep;
  #endif /* #ifdef CONFIG_EPOLL */
@@ -365,8 +367,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/mre
  
 diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet.c linux-6.1.44-pet/mm/pet.c
 --- linux-6.1.44-clean/mm/pet.c	1969-12-31 16:00:00
-+++ linux-6.1.44-pet/mm/pet.c	2026-07-12 07:20:38
-@@ -0,0 +1,2507 @@
++++ linux-6.1.44-pet/mm/pet.c	2026-07-12 07:59:27
+@@ -0,0 +1,2576 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * PET proactive demotion prototype.
@@ -375,6 +377,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 + * "PET: Proactive Demotion for Efficient Tiered Memory Management"
 + * (EuroSys 2025).
 + */
++#include <linux/backing-dev.h>
 +#include <linux/bitmap.h>
 +#include <linux/bitops.h>
 +#include <linux/delay.h>
@@ -401,6 +404,7 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +#include <linux/sched.h>
 +#include <linux/sched/sysctl.h>
 +#include <linux/seq_file.h>
++#include <linux/shmem_fs.h>
 +#include <linux/spinlock.h>
 +#include <linux/swapops.h>
 +#include <linux/uaccess.h>
@@ -411,6 +415,8 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +#define PET_PROC_DIR		"pet"
 +#define PET_PROC_ENABLED	"enabled"
 +#define PET_PROC_STATS		"stats"
++/* Failure-retry budget for one cold-file inode (see pet_process_cold_files). */
++#define PET_COLD_RETRY_MAX	10
 +
 +enum pet_pblock_state {
 +	PET_NORMAL = 0,
@@ -1217,8 +1223,11 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	 * Like DAMON, skip the TLB flush (a stale young bit only biases one
 +	 * sample) but do age secondary MMUs so KVM guest accesses are seen.
 +	 */
++#ifdef CONFIG_MMU_NOTIFIER
++	/* No stub exists for this one when CONFIG_MMU_NOTIFIER=n. */
 +	if (mmu_notifier_clear_young(walk->mm, addr, addr + PAGE_SIZE))
 +		ctx->accessed = true;
++#endif
 +	if (test_and_clear_page_young(page))
 +		ctx->accessed = true;
 +	return 0;
@@ -1247,9 +1256,11 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	ctx->present = true;
 +	if (pmdp_test_and_clear_young(walk->vma, addr & HPAGE_PMD_MASK, pmd))
 +		ctx->accessed = true;
++#ifdef CONFIG_MMU_NOTIFIER
 +	if (mmu_notifier_clear_young(walk->mm, addr & HPAGE_PMD_MASK,
 +				     (addr & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE))
 +		ctx->accessed = true;
++#endif
 +	if (test_and_clear_page_young(page))
 +		ctx->accessed = true;
 +out:
@@ -1455,9 +1466,16 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	mutex_unlock(&pet_lock);
 +}
 +
++/*
++ * On failure, canaries_installed and the seed are deliberately kept: the
++ * canary-demotion step may already have moved this seed's pages to the
++ * slow node, and reseeding on the retry would strand them there with no
++ * promotion path.  A retry reuses the same set (the migrate pass skips
++ * already-placed pages), and a block that turns hot in PHASE1 exits
++ * through pet_restore_phase2_pblock(), which promotes the set back.
++ */
 +static int pet_install_canaries(struct pet_pblock *pb)
 +{
-+	bool selected = false;
 +	long changed;
 +	long migrated;
 +
@@ -1466,7 +1484,6 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	if (!pb->canaries_installed) {
 +		pb->canary_seed = get_random_u32();
 +		pb->canaries_installed = true;
-+		selected = true;
 +		/*
 +		 * Raise the fast-path flag before any PTE is poisoned so a
 +		 * fault on a fresh canary cannot slip past the
@@ -1477,17 +1494,12 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	}
 +	migrated = pet_migrate_range(pb->mm, pb->start, pb->end, true, pb, true);
 +	if (migrated < 0)
-+		goto fail;
++		return migrated;
 +	changed = pet_update_canary_protection(pb, true);
 +	if (changed < 0)
-+		goto fail;
++		return changed;
 +	atomic64_add(changed, &pet_stats.canary_pages);
 +	return 0;
-+
-+fail:
-+	if (selected)
-+		pb->canaries_installed = false;
-+	return migrated < 0 ? migrated : changed;
 +}
 +
 +static int pet_remove_canaries(struct pet_pblock *pb)
@@ -1941,10 +1953,18 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		handled = true;
 +		goto out;
 +	}
-+	if (!pte_present(vmf->orig_pte) || !pte_protnone(vmf->orig_pte))
++	if (!pte_present(vmf->orig_pte) || !pte_protnone(vmf->orig_pte)) {
++		/*
++		 * Unreachable from the current call site (the hook is gated
++		 * on pte_protnone(orig_pte)); report handled so a future
++		 * caller cannot fall into do_numa_page() with the pte
++		 * already unmapped.
++		 */
++		handled = true;
 +		goto out;
++	}
 +
-+	old_pte = ptep_get(vmf->pte);
++	old_pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte);
 +	was_writable = pte_write(old_pte) || pte_savedwrite(old_pte);
 +	new_pte = pte_modify(old_pte, vma->vm_page_prot);
 +	new_pte = pte_mkyoung(new_pte);
@@ -2035,6 +2055,13 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		return false;
 +	if (IS_DAX(inode))
 +		return false;
++	/*
++	 * shmem/tmpfs folios stay dirty forever (no writeback path), so the
++	 * demotion pass could never move them anyway; don't queue and rewalk
++	 * them every scan for nothing.
++	 */
++	if (inode->i_mapping && shmem_mapping(inode->i_mapping))
++		return false;
 +	return true;
 +}
 +
@@ -2045,6 +2072,14 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +
 +static void pet_queue_cold_inode_locked(struct inode *inode, bool ref_held)
 +{
++	/*
++	 * Recheck the switches here, under the same pet_cold_lock they are
++	 * published under: a requeue decision made in an earlier critical
++	 * section can race with disable+drain and would otherwise park an
++	 * inode reference on the list while PET is off.
++	 */
++	if (!READ_ONCE(pet_enabled) || !READ_ONCE(pet_file_demote_enabled))
++		return;
 +	if (inode->i_pet_cold_queued || inode->i_pet_cold_processing)
 +		return;
 +	if (!ref_held)
@@ -2092,15 +2127,20 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +	spin_lock(&pet_cold_lock);
 +	if (atomic_dec_and_test(&inode->i_pet_open_count) &&
 +	    READ_ONCE(pet_enabled) && pet_file_eligible(file) &&
-+	    !inode->i_pet_cold_queued && !inode->i_pet_cold_processing)
++	    !inode->i_pet_cold_queued && !inode->i_pet_cold_processing) {
++		inode->i_pet_cold_retries = 0;
 +		pet_queue_cold_inode_locked(inode, false);
++	}
 +	spin_unlock(&pet_cold_lock);
 +}
 +
 +/*
-+ * @dirty_skipped (may be NULL): set when clean migration candidates were
-+ * skipped only because they were dirty or under writeback, so the caller
-+ * can retry after writeback instead of dropping the inode for good.
++ * @dirty_skipped (may be NULL): set when migration candidates were skipped
++ * only because they were dirty or under writeback, so the caller can retry
++ * after writeback instead of dropping the inode for good.  Only meaningful
++ * for mappings that can write back: shmem/ramfs folios stay dirty forever,
++ * and flagging them would requeue the inode (and pin its reference)
++ * endlessly.
 + */
 +static long pet_migrate_file_inode(struct inode *inode, bool demote,
 +				   bool *dirty_skipped)
@@ -2125,9 +2165,16 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +			struct folio *folio = fbatch.folios[i];
 +			int target;
 +
-+			if (folio_test_dirty(folio) ||
-+			    folio_test_writeback(folio)) {
-+				if (dirty_skipped)
++			if (folio_test_writeback(folio))
++				continue;
++			/*
++			 * Skip dirty folios only when demoting (conservative
++			 * direction); promoting a dirty folio back to the
++			 * fast tier is safe and keeps reopened files usable.
++			 */
++			if (demote && folio_test_dirty(folio)) {
++				if (dirty_skipped &&
++				    mapping_can_writeback(mapping))
 +					*dirty_skipped = true;
 +				continue;
 +			}
@@ -2299,6 +2346,21 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +		spin_lock(&pet_cold_lock);
 +		list_del_init(&inode->i_pet_cold_list);
 +		inode->i_pet_cold_processing = false;
++		if (requeue) {
++			/*
++			 * A generation change means fresh file activity:
++			 * start the retry budget over.  Pure failure
++			 * retries (slow node full, writeback pending) are
++			 * capped so a permanently unmigratable file does
++			 * not requeue and rewalk its page cache forever.
++			 */
++			if (raced)
++				inode->i_pet_cold_retries = 0;
++			else if (inode->i_pet_cold_retries < PET_COLD_RETRY_MAX)
++				inode->i_pet_cold_retries++;
++			else
++				requeue = false;
++		}
 +		if (requeue)
 +			pet_queue_cold_inode_locked(inode, false);
 +		/* Account our reference as detached until the iput below. */
@@ -2538,6 +2600,15 @@ diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet
 +				pet_reset_tracking(pb);
 +				if (!pet_install_canaries(pb))
 +					pb->state = PET_PHASE2;
++				break;
++			}
++			if (pb->canaries_installed) {
++				/*
++				 * Leftover set from a failed install: promote
++				 * the canary pages back before going NORMAL
++				 * (stays PHASE1 and retries on failure).
++				 */
++				pet_restore_phase2_pblock(pb);
 +				break;
 +			}
 +			pb->state = PET_NORMAL;

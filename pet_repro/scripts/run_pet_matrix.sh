@@ -59,19 +59,38 @@ run_one() {
   local rep="$3"
   local out="$OUT_ROOT/$name/rep-$rep"
 
+  local rc=0
+
   mkdir -p "$out"
   capture_stats "$out/before"
   printf '%s\n' "$cmd" > "$out/command.txt"
+  # A failing workload must not abort the rest of the matrix; record the
+  # exit code so the failed rep is visibly invalid.
   /usr/bin/time -f 'elapsed_sec=%e\nuser_sec=%U\nsys_sec=%S\nmaxrss_kb=%M' \
     -o "$out/time.txt" bash -lc "$cmd" \
-    > "$out/stdout.txt" 2> "$out/stderr.txt"
+    > "$out/stdout.txt" 2> "$out/stderr.txt" || rc=$?
+  echo "exit_code=$rc" >> "$out/time.txt"
+  if [[ "$rc" -ne 0 ]]; then
+    echo "WARN: $name rep-$rep exited with $rc" >&2
+  fi
   capture_stats "$out/after"
 }
 
 mkdir -p "$OUT_ROOT"
-if [[ -w /proc/pet/enabled ]]; then
-  echo "${PET_ENABLE:-1}" > /proc/pet/enabled
+PET_ENABLE="${PET_ENABLE:-1}"
+if [[ "$PET_ENABLE" == "1" ]]; then
+  if [[ -w /proc/pet/enabled ]]; then
+    echo 1 > /proc/pet/enabled
+  else
+    echo "ERROR: PET_ENABLE=1 but /proc/pet/enabled is not writable" >&2
+    echo "       (PET kernel booted? running as root?)" >&2
+    exit 1
+  fi
+elif [[ -w /proc/pet/enabled ]]; then
+  echo 0 > /proc/pet/enabled
 fi
+echo "NOTE: mode '$MODE' only labels the output directory; THP state and" >&2
+echo "      PET module parameters must be configured before this run." >&2
 
 for name in "${!COMMANDS[@]}"; do
   cmd="${COMMANDS[$name]}"

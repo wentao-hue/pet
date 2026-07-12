@@ -40,9 +40,12 @@ Primary artifacts:
   counters, and canary protection metadata before the old range is released.
 - Reopen-safe cold-file demotion with processing generations; folios already
   on their target node are skipped (an already-demoted file no longer fails
-  migration and requeues forever), and inodes whose pages were skipped only
-  for dirty/writeback are requeued so freshly written files are demoted
-  after writeback instead of being forgotten.
+  migration and requeues forever); inodes whose pages were skipped only for
+  dirty/writeback are requeued so freshly written files are demoted after
+  writeback; failure retries are capped per inode (fresh file activity
+  resets the budget); shmem/tmpfs inodes are not tracked (their folios stay
+  dirty forever, so demotion could never move them); promote-back accepts
+  dirty folios (safe direction) so reopened files return to the fast tier.
 - Runtime `file_demote_enabled=0` (and `enabled=0`, via proc or sysfs) drains
   queued cold-file inode references.
 - `generic_shutdown_super()` drains per-superblock cold-file queue and waits
@@ -69,6 +72,17 @@ python3 pet_repro/run_synthetic_phase_shift.py > /tmp/pet_phase_shift.csv
 - This is not a timing or bandwidth simulator.
 - PTE access-bit sampling is deterministic at MiB range granularity here.
 - Canary faults are estimated from accessed MiB and canary ratio.
+- Known model/kernel divergences (the model is a design-exploration tool;
+  do not use it to predict kernel behavior quantitatively):
+  the model sees perfect per-interval access sets, while the kernel checks
+  one armed random page per (temporary) block per interval — one-touch
+  streaming looks permanently hot to the model but cold to the kernel, and
+  sparse hot sets are protected by the model but often missed by the
+  kernel's probe; PHASE2 detection in the kernel comes only from canary
+  faults (no sampling), so kernel splits are noisier than the model's; the
+  model lacks the kernel's `samples_seen` gating; and the kernel's global
+  th_total counter includes PHASE2 canary faults while the model counts
+  only DEMOTED-block faults.
 - The kernel prototype now contains VMA/P-block hooks, `kdemoted`,
   `kpromoted`, PROT_NONE canary faults, promotion thresholds, and file-page
   demotion via inode open counts.
@@ -110,7 +124,7 @@ Small smoke test:
 
 ```bash
 cc -O2 -pthread pet_repro/microbench/hotset_shift.c -o /tmp/hotset_shift
-/tmp/hotset_shift --total-gb 1 --hot-gb 1 --threads 1 --phase-sec 1 --phases 2
+/tmp/hotset_shift --total-gb 2 --hot-gb 1 --threads 1 --phase-sec 1 --phases 2
 ```
 
 Paper-style run on the tiered-memory host:
