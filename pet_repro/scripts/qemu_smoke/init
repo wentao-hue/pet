@@ -1,0 +1,25 @@
+#!/bin/sh
+# Guest init for the PET QEMU functional smoke test.
+export PATH=/bin
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+echo "=== BOOT OK ==="
+grep -H 'MemTotal' /sys/devices/system/node/node*/meminfo 2>/dev/null
+echo "=== enabling PET via /proc ==="
+echo 1 > /proc/pet/enabled
+cat /proc/pet/enabled
+/memtoucher &
+i=0
+while [ $i -lt 14 ]; do
+  sleep 3
+  i=$((i+1))
+  echo "=== stats t$i ==="
+  grep -E 'pblocks_|captured|released|demoted_pages|promoted_pages|promoted_pblocks|fake_faults|canary_pages|sampled_pages|migration_failures' /proc/pet/stats
+done
+echo "=== FINAL FULL STATS ==="
+cat /proc/pet/stats
+echo "=== NODE MEM AFTER ==="
+grep -H 'MemFree\|MemUsed' /sys/devices/system/node/node*/meminfo 2>/dev/null
+echo "=== SMOKE DONE ==="
+poweroff -f

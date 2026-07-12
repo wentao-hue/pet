@@ -55,6 +55,13 @@ forever).  Before experiments set `kernel.numa_balancing=0`, and see
   with PET enabled (x86_64 cross build).
 - `checkpatch.pl --strict`: 0 errors.
 - User-space model tests pass (`python3 -m unittest pet_repro.test_pet_model`).
+- End-to-end functional smoke test in QEMU with two NUMA nodes
+  (`pet_repro/scripts/qemu_smoke/`): capture → two-phase cold detection →
+  PHASE1/PHASE2 canary pre-demotion → full demotion to the slow node
+  (with split/merge) → idle stability → fake-fault counting → threshold
+  promotion back to the fast node → a second automatic demotion cycle
+  after the workload goes idle again; zero migration failures, zero
+  kernel warnings.
 - Paper-level performance numbers still require a bare-metal tiered-memory
   host (DRAM + slow tier with a demotion path); nothing here fabricates
   results.

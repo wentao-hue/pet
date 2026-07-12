@@ -68,6 +68,8 @@
 | checkpatch --strict | 0 errors, 0 warnings；2 个 CHECK 为对局部 `spinlock_t *ptl` 变量的误报（内核 mm 代码惯用写法）；raw diff 仅缺 commit message 元数据 |
 | user-space model tests | passed（模型本身即论文两阶段采样语义,内核修复后与模型一致） |
 | hot-set microbenchmark smoke test | passed |
+| MMU_NOTIFIER=n 下 `mm/pet.o` | passed（KVM/DRM 全关,验证 `mmu_notifier_clear_young` 的 `#ifdef` 包裹） |
+| QEMU 双 NUMA 节点功能冒烟(`scripts/qemu_smoke/`) | passed: 256MB anon P-block 捕获 → 两阶段判冷 → PHASE1/PHASE2(canary ~10% 预降级+PROT_NONE)→ 全量降级到 node1(65536 页,含 split/merge 路径)→ 空闲期稳定、零误促升 → re-touch 触发 42 次 fake fault → th_block 阈值促升整块回 node0(promoted_pblocks=2)→ 再次空闲后自动完成第二轮全量降级;全程 migration_failures=0,无内核 WARNING/BUG/Oops |
 | full `vmlinux` | passed（docker concord-kbuild 交叉编译，defconfig+PET_TIERING+THP，`-d NETFILTER_XT_TARGET_TCPMSS` 因 macOS 大小写不敏感文件系统，与历史构建一致） |
 
 ## 剩余工程风险
