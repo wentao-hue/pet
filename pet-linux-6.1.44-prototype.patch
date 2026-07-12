@@ -1,0 +1,2844 @@
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/file_table.c linux-6.1.44-pet/fs/file_table.c
+--- linux-6.1.44-clean/fs/file_table.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/fs/file_table.c	2026-07-10 03:37:50
+@@ -28,6 +28,7 @@
+ #include <linux/ima.h>
+ #include <linux/swap.h>
+ #include <linux/kmemleak.h>
++#include <linux/pet.h>
+ 
+ #include <linux/atomic.h>
+ 
+@@ -248,6 +249,7 @@
+ 	file->f_op = fop;
+ 	if ((file->f_mode & (FMODE_READ | FMODE_WRITE)) == FMODE_READ)
+ 		i_readcount_inc(path->dentry->d_inode);
++	pet_file_opened(file);
+ 	return file;
+ }
+ 
+@@ -325,6 +327,7 @@
+ 	fops_put(file->f_op);
+ 	put_pid(file->f_owner.pid);
+ 	put_file_access(file);
++	pet_file_closed(file);
+ 	dput(dentry);
+ 	if (unlikely(mode & FMODE_NEED_UNMOUNT))
+ 		dissolve_on_fput(mnt);
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/inode.c linux-6.1.44-pet/fs/inode.c
+--- linux-6.1.44-clean/fs/inode.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/fs/inode.c	2026-07-11 02:23:23
+@@ -199,6 +199,14 @@
+ 	lockdep_set_class(&inode->i_rwsem, &sb->s_type->i_mutex_key);
+ 
+ 	atomic_set(&inode->i_dio_count, 0);
++#ifdef CONFIG_PET_TIERING
++	atomic_set(&inode->i_pet_open_count, 0);
++	INIT_LIST_HEAD(&inode->i_pet_cold_list);
++	inode->i_pet_cold_queued = false;
++	inode->i_pet_cold_processing = false;
++	inode->i_pet_cold_jiffies = 0;
++	inode->i_pet_cold_gen = 0;
++#endif
+ 
+ 	mapping->a_ops = &empty_aops;
+ 	mapping->host = inode;
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/open.c linux-6.1.44-pet/fs/open.c
+--- linux-6.1.44-clean/fs/open.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/fs/open.c	2026-07-10 03:37:25
+@@ -24,6 +24,7 @@
+ #include <linux/fs.h>
+ #include <linux/personality.h>
+ #include <linux/pagemap.h>
++#include <linux/pet.h>
+ #include <linux/syscalls.h>
+ #include <linux/rcupdate.h>
+ #include <linux/audit.h>
+@@ -931,6 +932,7 @@
+ 		}
+ 	}
+ 
++	pet_file_opened(f);
+ 	return 0;
+ 
+ cleanup_all:
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/fs/super.c linux-6.1.44-pet/fs/super.c
+--- linux-6.1.44-clean/fs/super.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/fs/super.c	2026-07-12 02:02:01
+@@ -36,6 +36,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/user_namespace.h>
+ #include <linux/fs_context.h>
++#include <linux/pet.h>
+ #include <uapi/linux/mount.h>
+ #include "internal.h"
+ 
+@@ -475,6 +476,12 @@
+ 		sb->s_flags &= ~SB_ACTIVE;
+ 
+ 		cgroup_writeback_umount();
++
++		/*
++		 * Drop the PET cold-file queue's inode references before
++		 * eviction; they would otherwise outlive the superblock.
++		 */
++		pet_sb_shutdown(sb);
+ 
+ 		/* Evict all inodes with zero refcount. */
+ 		evict_inodes(sb);
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/include/linux/fs.h linux-6.1.44-pet/include/linux/fs.h
+--- linux-6.1.44-clean/include/linux/fs.h	2023-08-08 11:03:51
++++ linux-6.1.44-pet/include/linux/fs.h	2026-07-11 02:23:23
+@@ -670,6 +670,14 @@
+ #if defined(CONFIG_IMA) || defined(CONFIG_FILE_LOCKING)
+ 	atomic_t		i_readcount; /* struct files open RO */
+ #endif
++#ifdef CONFIG_PET_TIERING
++	atomic_t		i_pet_open_count;
++	struct list_head	i_pet_cold_list;
++	bool			i_pet_cold_queued;
++	bool			i_pet_cold_processing;
++	unsigned long		i_pet_cold_jiffies;
++	unsigned long		i_pet_cold_gen;
++#endif
+ 	union {
+ 		const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
+ 		void (*free_inode)(struct inode *);
+@@ -972,6 +980,9 @@
+ 	/* Used by fs/eventpoll.c to link all the hooks to this file */
+ 	struct hlist_head	*f_ep;
+ #endif /* #ifdef CONFIG_EPOLL */
++#ifdef CONFIG_PET_TIERING
++	bool			f_pet_counted;
++#endif
+ 	struct address_space	*f_mapping;
+ 	errseq_t		f_wb_err;
+ 	errseq_t		f_sb_err; /* for syncfs */
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/include/linux/pet.h linux-6.1.44-pet/include/linux/pet.h
+--- linux-6.1.44-clean/include/linux/pet.h	1969-12-31 16:00:00
++++ linux-6.1.44-pet/include/linux/pet.h	2026-07-12 02:01:00
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_PET_H
++#define _LINUX_PET_H
++
++#include <linux/mm_types.h>
++
++struct file;
++struct inode;
++struct super_block;
++struct vm_fault;
++
++#ifdef CONFIG_PET_TIERING
++
++void pet_mmap_capture(struct mm_struct *mm, unsigned long start,
++		      unsigned long end, vm_flags_t vm_flags,
++		      struct file *file);
++void pet_munmap_release(struct mm_struct *mm, unsigned long start,
++			unsigned long end);
++void pet_mm_release(struct mm_struct *mm);
++void pet_mremap_moved(struct mm_struct *mm, unsigned long old_start,
++		      unsigned long old_end, unsigned long new_start,
++		      unsigned long new_end, vm_flags_t vm_flags,
++		      struct file *file);
++bool pet_handle_protnone_fault(struct vm_fault *vmf);
++void pet_file_opened(struct file *file);
++void pet_file_closed(struct file *file);
++void pet_sb_shutdown(struct super_block *sb);
++#else
++static inline void pet_mmap_capture(struct mm_struct *mm, unsigned long start,
++				    unsigned long end, vm_flags_t vm_flags,
++				    struct file *file)
++{
++}
++
++static inline void pet_munmap_release(struct mm_struct *mm, unsigned long start,
++				      unsigned long end)
++{
++}
++
++static inline void pet_mm_release(struct mm_struct *mm)
++{
++}
++
++static inline void pet_mremap_moved(struct mm_struct *mm,
++				    unsigned long old_start,
++				    unsigned long old_end,
++				    unsigned long new_start,
++				    unsigned long new_end,
++				    vm_flags_t vm_flags, struct file *file)
++{
++}
++
++static inline bool pet_handle_protnone_fault(struct vm_fault *vmf)
++{
++	return false;
++}
++
++static inline void pet_file_opened(struct file *file)
++{
++}
++
++static inline void pet_file_closed(struct file *file)
++{
++}
++
++static inline void pet_sb_shutdown(struct super_block *sb)
++{
++}
++#endif
++
++#endif /* _LINUX_PET_H */
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/Kconfig linux-6.1.44-pet/mm/Kconfig
+--- linux-6.1.44-clean/mm/Kconfig	2023-08-08 11:03:51
++++ linux-6.1.44-pet/mm/Kconfig	2026-07-10 03:45:36
+@@ -1154,6 +1154,20 @@
+ 	bool
+ 	depends on !STACK_GROWSUP
+ 
++config PET_TIERING
++	bool "PET proactive demotion prototype"
++	depends on X86_64 && MMU && NUMA && MIGRATION
++	help
++	  Enable a prototype implementation of PET (Proactive Demotion for
++	  Efficient Tiered Memory Management).  PET captures anonymous mmap()
++	  allocation ranges as P-blocks, samples PTE accessed bits, uses
++	  PROT_NONE canary faults for PHASE2/DEMOTED P-blocks, proactively
++	  demotes cold P-blocks and cold file pages, and promotes re-accessed
++	  demoted P-blocks with a background kpromoted thread.
++
++	  This is an experimental reconstruction of the EuroSys 2025 PET paper,
++	  intended for research reproduction rather than production use.
++
+ source "mm/damon/Kconfig"
+ 
+ endmenu
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/Makefile linux-6.1.44-pet/mm/Makefile
+--- linux-6.1.44-clean/mm/Makefile	2023-08-08 11:03:51
++++ linux-6.1.44-pet/mm/Makefile	2026-07-10 03:19:58
+@@ -138,3 +138,4 @@
+ obj-$(CONFIG_HAVE_BOOTMEM_INFO_NODE) += bootmem_info.o
+ obj-$(CONFIG_GENERIC_IOREMAP) += ioremap.o
+ obj-$(CONFIG_SHRINKER_DEBUG) += shrinker_debug.o
++obj-$(CONFIG_PET_TIERING) += pet.o
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/memory.c linux-6.1.44-pet/mm/memory.c
+--- linux-6.1.44-clean/mm/memory.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/mm/memory.c	2026-07-10 03:36:05
+@@ -74,6 +74,7 @@
+ #include <linux/oom.h>
+ #include <linux/numa.h>
+ #include <linux/perf_event.h>
++#include <linux/pet.h>
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
+ #include <linux/sched/sysctl.h>
+@@ -4986,8 +4987,11 @@
+ 	if (!pte_present(vmf->orig_pte))
+ 		return do_swap_page(vmf);
+ 
+-	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
++	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma)) {
++		if (pet_handle_protnone_fault(vmf))
++			return 0;
+ 		return do_numa_page(vmf);
++	}
+ 
+ 	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+ 	spin_lock(vmf->ptl);
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/mmap.c linux-6.1.44-pet/mm/mmap.c
+--- linux-6.1.44-clean/mm/mmap.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/mm/mmap.c	2026-07-12 00:55:37
+@@ -46,6 +46,7 @@
+ #include <linux/pkeys.h>
+ #include <linux/oom.h>
+ #include <linux/sched/mm.h>
++#include <linux/pet.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/cacheflush.h>
+@@ -2608,6 +2609,7 @@
+ {
+ 	unsigned long end;
+ 	struct vm_area_struct *vma;
++	int error;
+ 
+ 	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
+ 		return -EINVAL;
+@@ -2624,7 +2626,10 @@
+ 	if (!vma)
+ 		return 0;
+ 
+-	return do_mas_align_munmap(mas, vma, mm, start, end, uf, downgrade);
++	error = do_mas_align_munmap(mas, vma, mm, start, end, uf, downgrade);
++	if (error >= 0)
++		pet_munmap_release(mm, start, end);
++	return error;
+ }
+ 
+ /* do_munmap() - Wrapper function for non-maple tree aware do_munmap() calls.
+@@ -2716,6 +2721,8 @@
+ 	if (vma &&
+ 	    !vma_expand(&mas, vma, merge_start, merge_end, vm_pgoff, next)) {
+ 		khugepaged_enter_vma(vma, vm_flags);
++		pet_mmap_capture(mm, vma->vm_start, vma->vm_end,
++				 vm_flags, file);
+ 		goto expanded;
+ 	}
+ 
+@@ -2820,6 +2827,8 @@
+ 
+ 	vma_mas_store(vma, &mas);
+ 	mm->map_count++;
++	pet_mmap_capture(mm, vma->vm_start, vma->vm_end,
++			 vma->vm_flags, vma->vm_file);
+ 	if (vma->vm_file) {
+ 		if (vma->vm_flags & VM_SHARED)
+ 			mapping_allow_writable(vma->vm_file->f_mapping);
+@@ -3034,6 +3043,8 @@
+ 
+ 	arch_unmap(mm, newbrk, oldbrk);
+ 	ret = do_mas_align_munmap(mas, vma, mm, newbrk, oldbrk, uf, true);
++	if (ret >= 0)
++		pet_munmap_release(mm, newbrk, oldbrk);
+ 	validate_mm_mt(mm);
+ 	return ret;
+ }
+@@ -3115,6 +3126,7 @@
+ 
+ 	mm->map_count++;
+ out:
++	pet_mmap_capture(mm, vma->vm_start, vma->vm_end, flags, NULL);
+ 	perf_event_mmap(vma);
+ 	mm->total_vm += len >> PAGE_SHIFT;
+ 	mm->data_vm += len >> PAGE_SHIFT;
+@@ -3194,6 +3206,7 @@
+ 	int count = 0;
+ 
+ 	/* mm's last user has gone, and its about to be pulled down */
++	pet_mm_release(mm);
+ 	mmu_notifier_release(mm);
+ 
+ 	mmap_read_lock(mm);
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/mremap.c linux-6.1.44-pet/mm/mremap.c
+--- linux-6.1.44-clean/mm/mremap.c	2023-08-08 11:03:51
++++ linux-6.1.44-pet/mm/mremap.c	2026-07-12 00:55:27
+@@ -25,6 +25,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/userfaultfd_k.h>
+ #include <linux/mempolicy.h>
++#include <linux/pet.h>
+ 
+ #include <asm/cacheflush.h>
+ #include <asm/tlb.h>
+@@ -684,6 +685,11 @@
+ 	if (unlikely(vma->vm_flags & VM_PFNMAP))
+ 		untrack_pfn_moved(vma);
+ 
++	if (!err)
++		pet_mremap_moved(mm, old_addr, old_addr + old_len,
++				 new_addr, new_addr + new_len, vm_flags,
++				 vma->vm_file);
++
+ 	if (unlikely(!err && (flags & MREMAP_DONTUNMAP))) {
+ 		/* We always clear VM_LOCKED[ONFAULT] on the old vma */
+ 		vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
+@@ -1057,6 +1063,8 @@
+ 			}
+ 
+ 			vm_stat_account(mm, vma->vm_flags, pages);
++			pet_mmap_capture(mm, vma->vm_start, vma->vm_end,
++					 vma->vm_flags, vma->vm_file);
+ 			if (vma->vm_flags & VM_LOCKED) {
+ 				mm->locked_vm += pages;
+ 				locked = true;
+@@ -1074,6 +1082,7 @@
+ 	ret = -ENOMEM;
+ 	if (flags & MREMAP_MAYMOVE) {
+ 		unsigned long map_flags = 0;
++
+ 		if (vma->vm_flags & VM_MAYSHARE)
+ 			map_flags |= MAP_SHARED;
+ 
+diff -ruN --exclude=.git --exclude=*.o --exclude=*.cmd linux-6.1.44-clean/mm/pet.c linux-6.1.44-pet/mm/pet.c
+--- linux-6.1.44-clean/mm/pet.c	1969-12-31 16:00:00
++++ linux-6.1.44-pet/mm/pet.c	2026-07-12 04:28:07
+@@ -0,0 +1,2479 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * PET proactive demotion prototype.
++ *
++ * This is a clean-room reconstruction of the P-block policy described in
++ * "PET: Proactive Demotion for Efficient Tiered Memory Management"
++ * (EuroSys 2025).
++ */
++#include <linux/bitmap.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/fs.h>
++#include <linux/hash.h>
++#include <linux/init.h>
++#include <linux/kthread.h>
++#include <linux/list.h>
++#include <linux/memory-tiers.h>
++#include <linux/mempolicy.h>
++#include <linux/migrate.h>
++#include <linux/mm.h>
++#include <linux/mm_inline.h>
++#include <linux/mmu_notifier.h>
++#include <linux/moduleparam.h>
++#include <linux/page_idle.h>
++#include <linux/pagewalk.h>
++#include <linux/pagemap.h>
++#include <linux/pagevec.h>
++#include <linux/pet.h>
++#include <linux/prandom.h>
++#include <linux/proc_fs.h>
++#include <linux/refcount.h>
++#include <linux/sched.h>
++#include <linux/sched/sysctl.h>
++#include <linux/seq_file.h>
++#include <linux/spinlock.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++
++#include "internal.h"
++
++#define PET_PROC_DIR		"pet"
++#define PET_PROC_ENABLED	"enabled"
++#define PET_PROC_STATS		"stats"
++
++enum pet_pblock_state {
++	PET_NORMAL = 0,
++	PET_PHASE1,
++	PET_PHASE2,
++	PET_DEMOTED,
++	PET_NR_STATES,
++};
++
++struct pet_pblock {
++	struct list_head list;
++	struct list_head promote_list;
++	refcount_t refs;
++	/* Serializes policy state, tracking bitmaps, and long page walks. */
++	struct mutex lock;
++	struct mm_struct *mm;
++	unsigned long start;
++	unsigned long end;
++	enum pet_pblock_state state;
++	unsigned int samples_seen;
++	unsigned int nr_temp;
++	/*
++	 * Two-phase access sampling: an interval N sample clears the
++	 * accessed bit of a randomly chosen ("armed") page, and interval
++	 * N+1 checks whether that same page was re-referenced.  0 means
++	 * nothing is armed.
++	 */
++	unsigned long sample_addr;
++	unsigned long *temp_sample_addr;
++	unsigned long *temp_accessed;
++	unsigned long *temp_canary_installed;
++	u32 canary_seed;
++	unsigned long fault_count;
++	u64 fault_window;
++	bool canaries_installed;
++	bool promote_pending;
++	bool sampled_accessed;
++	bool dying;
++	u64 id;
++};
++
++struct pet_stats {
++	atomic64_t captured_pblocks;
++	atomic64_t released_pblocks;
++	atomic64_t sampled_pages;
++	atomic64_t demoted_pages;
++	atomic64_t promoted_pages;
++	atomic64_t canary_pages;
++	atomic64_t fake_faults;
++	atomic64_t promoted_pblocks;
++	atomic64_t file_pages_demoted;
++	atomic64_t file_inodes_queued;
++	atomic64_t migration_failures;
++};
++
++static LIST_HEAD(pet_pblocks);
++static LIST_HEAD(pet_promote_list);
++static LIST_HEAD(pet_cold_files);
++static LIST_HEAD(pet_processing_files);
++static DEFINE_MUTEX(pet_lock);
++/*
++ * Protects pet_cold_files, pet_processing_files, and the i_pet_cold_*
++ * inode fields.  Kept separate from pet_lock so that every open()/close()
++ * in the system does not contend with the fault path and the scan
++ * threads.  Never call iput() with this lock held.
++ */
++static DEFINE_SPINLOCK(pet_cold_lock);
++static DECLARE_WAIT_QUEUE_HEAD(pet_promote_wait);
++static struct pet_stats pet_stats;
++static struct task_struct *pet_demote_task;
++static struct task_struct *pet_promote_task;
++static struct proc_dir_entry *pet_proc_dir;
++static atomic64_t pet_next_id = ATOMIC64_INIT(1);
++static unsigned long pet_interval_faults;
++static atomic64_t pet_fault_window = ATOMIC64_INIT(0);
++/*
++ * True while any P-block may have PROT_NONE canaries installed, so the
++ * fault path can skip PET entirely (no pet_lock, no list scan) on
++ * systems where nothing is poisoned yet.  Written under pet_lock; only
++ * lowered by the authoritative rescan in pet_finish_scan(), so a stale
++ * "true" costs a slow path but never loses fault counts.
++ */
++static bool pet_have_poisoned;
++
++static bool pet_enabled;
++static bool pet_file_demote_enabled = true;
++static unsigned int pet_min_mmap_kb = 128;
++static unsigned int pet_max_pblock_mb = 1024;
++static unsigned int pet_temp_block_mb = 128;
++static unsigned int pet_canary_ratio = 10;
++static unsigned int pet_sampling_interval_ms = 500;
++static unsigned int pet_scan_interval_ms = 10000;
++static unsigned int pet_promo_faults_per_sec = 360;
++static int pet_fast_node = NUMA_NO_NODE;
++static int pet_slow_node = NUMA_NO_NODE;
++
++module_param_named(min_mmap_kb, pet_min_mmap_kb, uint, 0644);
++module_param_named(max_pblock_mb, pet_max_pblock_mb, uint, 0644);
++module_param_named(temp_block_mb, pet_temp_block_mb, uint, 0644);
++module_param_named(canary_ratio, pet_canary_ratio, uint, 0644);
++module_param_named(sampling_interval_ms, pet_sampling_interval_ms, uint, 0644);
++module_param_named(scan_interval_ms, pet_scan_interval_ms, uint, 0644);
++module_param_named(promo_faults_per_sec, pet_promo_faults_per_sec, uint, 0644);
++module_param_named(fast_node, pet_fast_node, int, 0644);
++module_param_named(slow_node, pet_slow_node, int, 0644);
++
++static void pet_clear_cold_files(void);
++static void pet_advance_fault_window_locked(void);
++
++static void pet_apply_enabled(bool value)
++{
++	mutex_lock(&pet_lock);
++	if (!value) {
++		pet_interval_faults = 0;
++		pet_advance_fault_window_locked();
++	}
++	mutex_unlock(&pet_lock);
++	/*
++	 * Publish the flag under pet_cold_lock so it serializes with the
++	 * cold-file requeue decision; otherwise a racing requeue could
++	 * re-add an inode right before pet_clear_cold_files() and park a
++	 * reference until the next enable or unmount.
++	 */
++	spin_lock(&pet_cold_lock);
++	WRITE_ONCE(pet_enabled, value);
++	spin_unlock(&pet_cold_lock);
++	if (!value)
++		pet_clear_cold_files();
++	else if (sysctl_numa_balancing_mode)
++		pr_warn("pet: NUMA balancing is active; canary faults will be miscounted, set kernel.numa_balancing=0 for experiments\n");
++}
++
++static int pet_enabled_param_set(const char *val,
++				 const struct kernel_param *kp)
++{
++	bool value;
++	int ret;
++
++	ret = kstrtobool(val, &value);
++	if (ret)
++		return ret;
++
++	pet_apply_enabled(value);
++	return 0;
++}
++
++static const struct kernel_param_ops pet_enabled_param_ops = {
++	.set = pet_enabled_param_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(enabled, &pet_enabled_param_ops, &pet_enabled, 0644);
++
++static int pet_file_demote_enabled_set(const char *val,
++				       const struct kernel_param *kp)
++{
++	bool value;
++	int ret;
++
++	ret = kstrtobool(val, &value);
++	if (ret)
++		return ret;
++
++	/* Serialize with the requeue decision; see pet_apply_enabled(). */
++	spin_lock(&pet_cold_lock);
++	WRITE_ONCE(pet_file_demote_enabled, value);
++	spin_unlock(&pet_cold_lock);
++	if (!value)
++		pet_clear_cold_files();
++	return 0;
++}
++
++static const struct kernel_param_ops pet_file_demote_enabled_ops = {
++	.set = pet_file_demote_enabled_set,
++	.get = param_get_bool,
++};
++
++module_param_cb(file_demote_enabled, &pet_file_demote_enabled_ops,
++		&pet_file_demote_enabled, 0644);
++
++static u64 pet_current_fault_window(void)
++{
++	return (u64)atomic64_read(&pet_fault_window);
++}
++
++static void pet_advance_fault_window_locked(void)
++{
++	atomic64_inc(&pet_fault_window);
++}
++
++static unsigned long pet_mb_to_bytes(unsigned int mb)
++{
++	return (unsigned long)max_t(unsigned int, mb, 1) << 20;
++}
++
++static unsigned long pet_temp_bytes(void)
++{
++	return pet_mb_to_bytes(READ_ONCE(pet_temp_block_mb));
++}
++
++static unsigned long pet_max_pblock_bytes(void)
++{
++	return pet_mb_to_bytes(READ_ONCE(pet_max_pblock_mb));
++}
++
++static unsigned int pet_samples_per_scan(void)
++{
++	unsigned int sample = max_t(unsigned int,
++				    READ_ONCE(pet_sampling_interval_ms), 1);
++	unsigned int scan = max_t(unsigned int,
++				  READ_ONCE(pet_scan_interval_ms), sample);
++
++	return max_t(unsigned int, DIV_ROUND_UP(scan, sample), 1);
++}
++
++static unsigned int pet_canary_ratio_pct(void)
++{
++	return clamp_t(unsigned int, READ_ONCE(pet_canary_ratio), 1, 100);
++}
++
++static unsigned long pet_promotion_total_threshold(void)
++{
++	unsigned long sample = max_t(unsigned int,
++				     READ_ONCE(pet_sampling_interval_ms), 1);
++	unsigned long rate = max_t(unsigned int,
++				   READ_ONCE(pet_promo_faults_per_sec), 1);
++
++	return max_t(unsigned long, DIV_ROUND_UP(rate * sample, 1000), 1);
++}
++
++static unsigned long pet_pblock_bytes(struct pet_pblock *pb)
++{
++	return pb->end - pb->start;
++}
++
++static unsigned int pet_temp_index(struct pet_pblock *pb, unsigned long addr)
++{
++	return min_t(unsigned int,
++		     (addr - pb->start) / pet_temp_bytes(),
++		     pb->nr_temp ? pb->nr_temp - 1 : 0);
++}
++
++static bool pet_addr_is_canary(struct pet_pblock *pb, unsigned long addr)
++{
++	unsigned long pgoff;
++	u32 hashed;
++
++	if (!pb->canaries_installed || addr < pb->start || addr >= pb->end)
++		return false;
++	pgoff = addr >> PAGE_SHIFT;
++	hashed = hash_32((u32)pgoff ^ pb->canary_seed, 10);
++	return hashed % 100 < pet_canary_ratio_pct();
++}
++
++static unsigned long pet_random_page_addr(unsigned long start,
++					  unsigned long end)
++{
++	unsigned long pages;
++
++	if (end <= start + PAGE_SIZE)
++		return start;
++	pages = (end - start) >> PAGE_SHIFT;
++	return start + prandom_u32_max(pages) * PAGE_SIZE;
++}
++
++static bool pet_vma_eligible(vm_flags_t vm_flags, struct file *file,
++			     unsigned long len)
++{
++	unsigned long min_len = (unsigned long)READ_ONCE(pet_min_mmap_kb) << 10;
++	vm_flags_t excluded = VM_SHARED | VM_SPECIAL | VM_IO | VM_PFNMAP |
++			      VM_HUGETLB | VM_STACK;
++
++	if (!READ_ONCE(pet_enabled))
++		return false;
++	if (file)
++		return false;
++	if (len < min_len)
++		return false;
++	if (!(vm_flags & VM_WRITE))
++		return false;
++	if (vm_flags & excluded)
++		return false;
++	return true;
++}
++
++static void pet_sync_fault_window_locked(struct pet_pblock *pb)
++{
++	u64 window = pet_current_fault_window();
++
++	if (pb->fault_window == window)
++		return;
++	pb->fault_window = window;
++	pb->fault_count = 0;
++}
++
++static void pet_init_pblock(struct pet_pblock *pb)
++{
++	INIT_LIST_HEAD(&pb->list);
++	INIT_LIST_HEAD(&pb->promote_list);
++	refcount_set(&pb->refs, 1);
++	mutex_init(&pb->lock);
++}
++
++static void pet_destroy_pblock(struct pet_pblock *pb)
++{
++	bitmap_free(pb->temp_accessed);
++	bitmap_free(pb->temp_canary_installed);
++	kfree(pb->temp_sample_addr);
++	kfree(pb);
++	atomic64_inc(&pet_stats.released_pblocks);
++}
++
++static void pet_put_pblock(struct pet_pblock *pb)
++{
++	if (refcount_dec_and_test(&pb->refs))
++		pet_destroy_pblock(pb);
++}
++
++static bool pet_get_pblock_locked(struct pet_pblock *pb)
++{
++	if (READ_ONCE(pb->dying))
++		return false;
++	return refcount_inc_not_zero(&pb->refs);
++}
++
++static void pet_free_pblock(struct pet_pblock *pb)
++{
++	if (READ_ONCE(pb->dying))
++		return;
++	WRITE_ONCE(pb->dying, true);
++	if (pb->promote_pending)
++		list_del_init(&pb->promote_list);
++	pb->promote_pending = false;
++	if (!list_empty(&pb->list))
++		list_del_init(&pb->list);
++	pet_put_pblock(pb);
++}
++
++static void pet_reset_tracking(struct pet_pblock *pb)
++{
++	pb->sampled_accessed = false;
++	pb->samples_seen = 0;
++	pb->fault_count = 0;
++	pb->fault_window = pet_current_fault_window();
++	pb->sample_addr = 0;
++	if (pb->temp_accessed)
++		bitmap_zero(pb->temp_accessed, pb->nr_temp);
++	if (pb->temp_sample_addr)
++		memset(pb->temp_sample_addr, 0,
++		       pb->nr_temp * sizeof(*pb->temp_sample_addr));
++}
++
++static int pet_prepare_temp(struct pet_pblock *pb)
++{
++	unsigned long temp = pet_temp_bytes();
++	unsigned long len = pb->end - pb->start;
++	unsigned int nr = max_t(unsigned int, DIV_ROUND_UP(len, temp), 1);
++	bool had_canaries = pb->canaries_installed;
++
++	if (pb->temp_accessed && pb->temp_canary_installed &&
++	    pb->temp_sample_addr && pb->nr_temp == nr)
++		return 0;
++
++	bitmap_free(pb->temp_accessed);
++	bitmap_free(pb->temp_canary_installed);
++	kfree(pb->temp_sample_addr);
++	pb->temp_accessed = bitmap_zalloc(nr, GFP_KERNEL);
++	pb->temp_canary_installed = bitmap_zalloc(nr, GFP_KERNEL);
++	pb->temp_sample_addr = kcalloc(nr, sizeof(*pb->temp_sample_addr),
++				       GFP_KERNEL);
++	if (!pb->temp_accessed || !pb->temp_canary_installed ||
++	    !pb->temp_sample_addr) {
++		bitmap_free(pb->temp_accessed);
++		bitmap_free(pb->temp_canary_installed);
++		kfree(pb->temp_sample_addr);
++		pb->temp_accessed = NULL;
++		pb->temp_canary_installed = NULL;
++		pb->temp_sample_addr = NULL;
++		pb->nr_temp = 0;
++		return -ENOMEM;
++	}
++	pb->nr_temp = nr;
++	if (had_canaries)
++		bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
++	else
++		bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
++	return 0;
++}
++
++static void pet_cancel_promotion_locked(struct pet_pblock *pb)
++{
++	if (!pb->promote_pending)
++		return;
++	list_del_init(&pb->promote_list);
++	pb->promote_pending = false;
++}
++
++static void pet_resize_tracking(struct pet_pblock *pb)
++{
++	pet_cancel_promotion_locked(pb);
++	pb->sampled_accessed = false;
++	pb->samples_seen = 0;
++	pb->fault_count = 0;
++	pb->fault_window = pet_current_fault_window();
++	pb->sample_addr = 0;
++	bitmap_free(pb->temp_accessed);
++	bitmap_free(pb->temp_canary_installed);
++	kfree(pb->temp_sample_addr);
++	pb->temp_accessed = NULL;
++	pb->temp_canary_installed = NULL;
++	pb->temp_sample_addr = NULL;
++	pb->nr_temp = 0;
++	if (pb->state != PET_NORMAL || pb->canaries_installed)
++		pet_prepare_temp(pb);
++}
++
++static struct pet_pblock *pet_clone_pblock_range(struct pet_pblock *src,
++						 unsigned long start,
++						 unsigned long end)
++{
++	struct pet_pblock *pb;
++
++	pb = kzalloc(sizeof(*pb), GFP_KERNEL);
++	if (!pb)
++		return NULL;
++	pet_init_pblock(pb);
++	pb->mm = src->mm;
++	pb->start = start;
++	pb->end = end;
++	pb->state = src->state;
++	pb->canary_seed = src->canary_seed;
++	pb->canaries_installed = src->canaries_installed;
++	pb->id = atomic64_inc_return(&pet_next_id);
++	pet_resize_tracking(pb);
++	atomic64_inc(&pet_stats.captured_pblocks);
++	return pb;
++}
++
++static struct pet_pblock *pet_get_next_pblock(u64 *cursor, u64 max_id);
++static bool pet_lock_live_pblock(struct pet_pblock *pb);
++static long pet_restore_mremap_canaries(struct pet_pblock *old_pb,
++					struct pet_pblock *new_pb,
++					unsigned long old_start);
++static long pet_update_canary_protection_locked(struct pet_pblock *pb,
++						bool protect);
++
++static void pet_copy_mremap_temp_bitmap(struct pet_pblock *src,
++					struct pet_pblock *dst,
++					unsigned long old_start,
++					unsigned long old_end,
++					unsigned long new_start,
++					unsigned long *src_map,
++					unsigned long *dst_map)
++{
++	unsigned long temp = pet_temp_bytes();
++	unsigned int first, last, i;
++
++	if (!src_map || !dst_map || !src->nr_temp || !dst->nr_temp ||
++	    old_end <= old_start)
++		return;
++
++	first = pet_temp_index(src, old_start);
++	last = pet_temp_index(src, old_end - 1);
++	for (i = first; i <= last && i < src->nr_temp; i++) {
++		unsigned long src_start = src->start + i * temp;
++		unsigned long src_end = min(src_start + temp, src->end);
++		unsigned long moved_start, moved_end;
++		unsigned long dst_start, dst_end;
++		unsigned int dst_first, dst_last, j;
++
++		if (!test_bit(i, src_map))
++			continue;
++		moved_start = max(src_start, old_start);
++		moved_end = min(src_end, old_end);
++		if (moved_start >= moved_end)
++			continue;
++		dst_start = new_start + moved_start - old_start;
++		dst_end = new_start + moved_end - old_start;
++		dst_first = pet_temp_index(dst, dst_start);
++		dst_last = pet_temp_index(dst, dst_end - 1);
++		for (j = dst_first; j <= dst_last && j < dst->nr_temp; j++)
++			__set_bit(j, dst_map);
++	}
++}
++
++static struct pet_pblock *pet_clone_pblock_mremap(struct pet_pblock *src,
++						  unsigned long old_start,
++						  unsigned long old_end,
++						  unsigned long new_start,
++						  unsigned long new_end)
++{
++	struct pet_pblock *pb;
++
++	pb = kzalloc(sizeof(*pb), GFP_KERNEL);
++	if (!pb)
++		return NULL;
++
++	pet_init_pblock(pb);
++	pb->mm = src->mm;
++	pb->start = new_start;
++	pb->end = new_end;
++	pb->state = src->state;
++	pb->samples_seen = src->samples_seen;
++	pb->canary_seed = src->canary_seed;
++	pb->fault_count = src->fault_count;
++	pb->fault_window = src->fault_window;
++	pb->canaries_installed = src->canaries_installed;
++	pb->sampled_accessed = src->sampled_accessed;
++	pb->id = atomic64_inc_return(&pet_next_id);
++
++	if (pb->state != PET_NORMAL || pb->canaries_installed ||
++	    src->temp_accessed || src->temp_canary_installed) {
++		if (pet_prepare_temp(pb)) {
++			bitmap_free(pb->temp_accessed);
++			bitmap_free(pb->temp_canary_installed);
++			kfree(pb);
++			return NULL;
++		}
++		if (pb->temp_accessed)
++			bitmap_zero(pb->temp_accessed, pb->nr_temp);
++		if (pb->temp_canary_installed)
++			bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
++		pet_copy_mremap_temp_bitmap(src, pb, old_start, old_end,
++					    new_start, src->temp_accessed,
++					    pb->temp_accessed);
++		pet_copy_mremap_temp_bitmap(src, pb, old_start, old_end,
++					    new_start,
++					    src->temp_canary_installed,
++					    pb->temp_canary_installed);
++		if (pb->canaries_installed && pb->temp_canary_installed &&
++		    !src->temp_canary_installed)
++			bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
++	}
++
++	atomic64_inc(&pet_stats.captured_pblocks);
++	return pb;
++}
++
++static struct pet_pblock *
++pet_first_overlapping_pblock_locked(struct mm_struct *mm,
++				    unsigned long start, unsigned long end)
++{
++	struct pet_pblock *pb, *best = NULL;
++
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (READ_ONCE(pb->dying) || pb->mm != mm)
++			continue;
++		if (pb->end <= start || pb->start >= end)
++			continue;
++		if (!best || pb->start < best->start ||
++		    (pb->start == best->start && pb->end < best->end))
++			best = pb;
++	}
++	return best;
++}
++
++static void pet_capture_gap_locked(struct mm_struct *mm, unsigned long start,
++				   unsigned long end)
++{
++	unsigned long max_len = pet_max_pblock_bytes();
++
++	while (start < end) {
++		struct pet_pblock *pb;
++		unsigned long next = min(start + max_len, end);
++
++		pb = kzalloc(sizeof(*pb), GFP_KERNEL);
++		if (!pb)
++			break;
++
++		pet_init_pblock(pb);
++		pb->mm = mm;
++		pb->start = start;
++		pb->end = next;
++		pb->state = PET_NORMAL;
++		pb->id = atomic64_inc_return(&pet_next_id);
++		pb->canary_seed = get_random_u32();
++		list_add_tail(&pb->list, &pet_pblocks);
++		atomic64_inc(&pet_stats.captured_pblocks);
++		start = next;
++	}
++}
++
++static void pet_trim_pblock(struct pet_pblock *pb,
++			    unsigned long start, unsigned long end)
++{
++	unsigned long old_start = pb->start;
++	unsigned long old_end = pb->end;
++	unsigned long left_end = min(start, old_end);
++	unsigned long right_start = max(end, old_start);
++	struct pet_pblock *right;
++
++	if (start <= old_start && end >= old_end) {
++		mutex_lock(&pet_lock);
++		pet_free_pblock(pb);
++		mutex_unlock(&pet_lock);
++		return;
++	}
++
++	if (READ_ONCE(pb->dying))
++		return;
++
++	if (old_start < left_end && right_start < old_end) {
++		right = pet_clone_pblock_range(pb, right_start, old_end);
++		mutex_lock(&pet_lock);
++		if (READ_ONCE(pb->dying) || list_empty(&pb->list)) {
++			mutex_unlock(&pet_lock);
++			if (right)
++				pet_free_pblock(right);
++			return;
++		}
++		if (!right) {
++			pb->end = left_end;
++			pet_resize_tracking(pb);
++			mutex_unlock(&pet_lock);
++			return;
++		}
++		pb->end = left_end;
++		pet_resize_tracking(pb);
++		list_add(&right->list, &pb->list);
++		if (right->canaries_installed)
++			WRITE_ONCE(pet_have_poisoned, true);
++		mutex_unlock(&pet_lock);
++		return;
++	}
++
++	if (old_start < left_end) {
++		mutex_lock(&pet_lock);
++		if (READ_ONCE(pb->dying) || list_empty(&pb->list)) {
++			mutex_unlock(&pet_lock);
++			return;
++		}
++		pb->end = left_end;
++		pet_resize_tracking(pb);
++		mutex_unlock(&pet_lock);
++		return;
++	}
++
++	if (right_start < old_end) {
++		mutex_lock(&pet_lock);
++		if (READ_ONCE(pb->dying) || list_empty(&pb->list)) {
++			mutex_unlock(&pet_lock);
++			return;
++		}
++		pb->start = right_start;
++		pet_resize_tracking(pb);
++		mutex_unlock(&pet_lock);
++		return;
++	}
++
++	mutex_lock(&pet_lock);
++	pet_free_pblock(pb);
++	mutex_unlock(&pet_lock);
++}
++
++void pet_mmap_capture(struct mm_struct *mm, unsigned long start,
++		      unsigned long end, vm_flags_t vm_flags,
++		      struct file *file)
++{
++	unsigned long pos = start;
++
++	if (end <= start || !pet_vma_eligible(vm_flags, file, end - start))
++		return;
++
++	mutex_lock(&pet_lock);
++	while (pos < end) {
++		struct pet_pblock *pb;
++		unsigned long gap_end;
++
++		pb = pet_first_overlapping_pblock_locked(mm, pos, end);
++		if (pb && pb->start <= pos) {
++			pos = min(pb->end, end);
++			continue;
++		}
++
++		gap_end = pb ? min(pb->start, end) : end;
++		pet_capture_gap_locked(mm, pos, gap_end);
++		pos = gap_end;
++	}
++	mutex_unlock(&pet_lock);
++}
++
++void pet_mremap_moved(struct mm_struct *mm, unsigned long old_start,
++		      unsigned long old_end, unsigned long new_start,
++		      unsigned long new_end, vm_flags_t vm_flags,
++		      struct file *file)
++{
++	struct pet_pblock *pb;
++	LIST_HEAD(moved);
++	u64 cursor = 0;
++
++	if (old_end <= old_start || new_end <= new_start)
++		return;
++
++	while ((pb = pet_get_next_pblock(&cursor, ~0ULL))) {
++		if (pb->mm != mm)
++			goto put;
++		if (pet_lock_live_pblock(pb)) {
++			unsigned long seg_start = max(old_start, pb->start);
++			unsigned long seg_end = min(old_end, pb->end);
++			struct pet_pblock *new_pb;
++			unsigned long new_seg_start, new_seg_end;
++
++			if (seg_start >= seg_end)
++				goto unlock;
++
++			new_seg_start = new_start + seg_start - old_start;
++			new_seg_end = new_start + seg_end - old_start;
++			new_seg_end = min(new_seg_end, new_end);
++			if (new_seg_start >= new_seg_end)
++				goto unlock;
++
++			new_pb = pet_clone_pblock_mremap(pb, seg_start, seg_end,
++							 new_seg_start,
++							 new_seg_end);
++			if (!new_pb)
++				goto unlock;
++
++			if (new_pb->canaries_installed) {
++				long restored;
++				long protected;
++
++				restored = pet_restore_mremap_canaries(pb,
++								       new_pb,
++								       seg_start);
++				protected = restored < 0 ? restored :
++					pet_update_canary_protection_locked(new_pb,
++									    true);
++				if (restored < 0 || protected < 0) {
++					new_pb->state = PET_NORMAL;
++					new_pb->canaries_installed = false;
++					pet_resize_tracking(new_pb);
++				} else {
++					atomic64_add(protected,
++						     &pet_stats.canary_pages);
++				}
++			}
++			list_add_tail(&new_pb->list, &moved);
++unlock:
++			mutex_unlock(&pb->lock);
++		}
++put:
++		pet_put_pblock(pb);
++		cond_resched();
++	}
++
++	if (!list_empty(&moved)) {
++		struct pet_pblock *new_pb;
++
++		mutex_lock(&pet_lock);
++		list_for_each_entry(new_pb, &moved, list) {
++			if (new_pb->canaries_installed)
++				WRITE_ONCE(pet_have_poisoned, true);
++		}
++		list_splice_tail_init(&moved, &pet_pblocks);
++		mutex_unlock(&pet_lock);
++	}
++
++	pet_mmap_capture(mm, new_start, new_end, vm_flags, file);
++}
++
++void pet_munmap_release(struct mm_struct *mm, unsigned long start,
++			unsigned long end)
++{
++	struct pet_pblock *pb;
++	u64 cursor = 0;
++
++	if (end <= start)
++		return;
++
++	while ((pb = pet_get_next_pblock(&cursor, ~0ULL))) {
++		if (pb->mm != mm)
++			goto put;
++		if (pet_lock_live_pblock(pb)) {
++			if (start < pb->end && end > pb->start)
++				pet_trim_pblock(pb, start, end);
++			mutex_unlock(&pb->lock);
++		}
++put:
++		pet_put_pblock(pb);
++		cond_resched();
++	}
++}
++
++void pet_mm_release(struct mm_struct *mm)
++{
++	struct pet_pblock *pb, *tmp;
++	LIST_HEAD(releasing);
++
++	mutex_lock(&pet_lock);
++	list_for_each_entry_safe(pb, tmp, &pet_pblocks, list) {
++		if (pb->mm != mm)
++			continue;
++		if (!pet_get_pblock_locked(pb))
++			continue;
++		pet_free_pblock(pb);
++		list_add_tail(&pb->list, &releasing);
++	}
++	mutex_unlock(&pet_lock);
++
++	list_for_each_entry_safe(pb, tmp, &releasing, list) {
++		mutex_lock(&pb->lock);
++		mutex_unlock(&pb->lock);
++		list_del_init(&pb->list);
++		pet_put_pblock(pb);
++	}
++}
++
++struct pet_sample_ctx {
++	bool accessed;
++	bool present;
++};
++
++static int pet_sample_pte_entry(pte_t *pte, unsigned long addr,
++				unsigned long next, struct mm_walk *walk)
++{
++	struct pet_sample_ctx *ctx = walk->private;
++	struct page *page;
++
++	if (!pte_present(*pte))
++		return 0;
++
++	page = vm_normal_page(walk->vma, addr, *pte);
++	if (!page || is_zone_device_page(page) || PageReserved(page))
++		return 0;
++
++	ctx->present = true;
++	if (ptep_test_and_clear_young(walk->vma, addr, pte))
++		ctx->accessed = true;
++	if (test_and_clear_page_young(page))
++		ctx->accessed = true;
++	return 0;
++}
++
++/*
++ * Handle huge PMDs at PMD granularity so that sampling never implicitly
++ * splits transparent huge pages (a pte_entry-only walk would).
++ */
++static int pet_sample_pmd_entry(pmd_t *pmd, unsigned long addr,
++				unsigned long next, struct mm_walk *walk)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	struct pet_sample_ctx *ctx = walk->private;
++	spinlock_t *ptl;
++	struct page *page;
++
++	ptl = pmd_trans_huge_lock(pmd, walk->vma);
++	if (!ptl)
++		return 0;
++	if (!pmd_present(*pmd) || is_huge_zero_pmd(*pmd))
++		goto out;
++	page = pmd_page(*pmd);
++	if (PageReserved(page))
++		goto out;
++	ctx->present = true;
++	if (pmdp_test_and_clear_young(walk->vma, addr & HPAGE_PMD_MASK, pmd))
++		ctx->accessed = true;
++	if (test_and_clear_page_young(page))
++		ctx->accessed = true;
++out:
++	spin_unlock(ptl);
++	walk->action = ACTION_CONTINUE;
++#endif
++	return 0;
++}
++
++static const struct mm_walk_ops pet_sample_walk_ops = {
++	.pmd_entry = pet_sample_pmd_entry,
++	.pte_entry = pet_sample_pte_entry,
++};
++
++static long pet_migrate_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long end, bool demote,
++			      struct pet_pblock *pb, bool canary_only);
++
++struct pet_protect_ctx {
++	struct pet_pblock *pb;
++	bool protect;
++	unsigned long changed;
++};
++
++static int pet_canary_protect_pte_entry(pte_t *pte, unsigned long addr,
++					unsigned long next,
++					struct mm_walk *walk)
++{
++	struct pet_protect_ctx *ctx = walk->private;
++	struct vm_area_struct *vma = walk->vma;
++	pte_t old_pte, new_pte;
++	bool was_writable;
++
++	if (!pet_addr_is_canary(ctx->pb, addr))
++		return 0;
++	if (!pte_present(*pte))
++		return 0;
++	if (ctx->protect && pte_protnone(*pte))
++		return 0;
++	if (!ctx->protect && !pte_protnone(*pte))
++		return 0;
++
++	old_pte = ptep_modify_prot_start(vma, addr, pte);
++	was_writable = pte_write(old_pte) || pte_savedwrite(old_pte);
++	if (ctx->protect) {
++		new_pte = pte_modify(old_pte, PAGE_NONE);
++		if (was_writable)
++			new_pte = pte_mk_savedwrite(new_pte);
++	} else {
++		new_pte = pte_modify(old_pte, vma->vm_page_prot);
++		new_pte = pte_mkyoung(new_pte);
++		if (was_writable)
++			new_pte = pte_mkwrite(new_pte);
++	}
++	ptep_modify_prot_commit(vma, addr, pte, old_pte, new_pte);
++	flush_tlb_page(vma, addr);
++	ctx->changed++;
++	return 0;
++}
++
++/*
++ * Canaries live at 4KB granularity.  Installing them over a huge PMD
++ * deliberately splits it once (Thermostat-style poisoning); restoring
++ * must never split, because an intact huge PMD cannot contain PTE-level
++ * canaries.
++ */
++static int pet_canary_protect_pmd_entry(pmd_t *pmd, unsigned long addr,
++					unsigned long next,
++					struct mm_walk *walk)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	struct pet_protect_ctx *ctx = walk->private;
++
++	if (!ctx->protect && pmd_trans_huge(*pmd))
++		walk->action = ACTION_CONTINUE;
++#endif
++	return 0;
++}
++
++static const struct mm_walk_ops pet_canary_protect_walk_ops = {
++	.pmd_entry = pet_canary_protect_pmd_entry,
++	.pte_entry = pet_canary_protect_pte_entry,
++};
++
++struct pet_mremap_restore_ctx {
++	struct pet_pblock *pb;
++	unsigned long old_start;
++	unsigned long new_start;
++	unsigned long changed;
++};
++
++static int pet_restore_mremap_canary_pte_entry(pte_t *pte, unsigned long addr,
++					       unsigned long next,
++					       struct mm_walk *walk)
++{
++	struct pet_mremap_restore_ctx *ctx = walk->private;
++	struct vm_area_struct *vma = walk->vma;
++	unsigned long old_addr = ctx->old_start + addr - ctx->new_start;
++	pte_t old_pte, new_pte;
++	bool was_writable;
++
++	if (!pet_addr_is_canary(ctx->pb, old_addr))
++		return 0;
++	if (!pte_present(*pte) || !pte_protnone(*pte))
++		return 0;
++
++	old_pte = ptep_modify_prot_start(vma, addr, pte);
++	was_writable = pte_write(old_pte) || pte_savedwrite(old_pte);
++	new_pte = pte_modify(old_pte, vma->vm_page_prot);
++	new_pte = pte_mkyoung(new_pte);
++	if (was_writable)
++		new_pte = pte_mkwrite(new_pte);
++	ptep_modify_prot_commit(vma, addr, pte, old_pte, new_pte);
++	flush_tlb_page(vma, addr);
++	ctx->changed++;
++	return 0;
++}
++
++/* An intact huge PMD holds no PTE-level canaries; never split here. */
++static int pet_mremap_restore_pmd_entry(pmd_t *pmd, unsigned long addr,
++					unsigned long next,
++					struct mm_walk *walk)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	if (pmd_trans_huge(*pmd))
++		walk->action = ACTION_CONTINUE;
++#endif
++	return 0;
++}
++
++static const struct mm_walk_ops pet_mremap_restore_walk_ops = {
++	.pmd_entry = pet_mremap_restore_pmd_entry,
++	.pte_entry = pet_restore_mremap_canary_pte_entry,
++};
++
++static long pet_restore_mremap_canaries(struct pet_pblock *old_pb,
++					struct pet_pblock *new_pb,
++					unsigned long old_start)
++{
++	struct pet_mremap_restore_ctx ctx = {
++		.pb = old_pb,
++		.old_start = old_start,
++		.new_start = new_pb->start,
++	};
++	struct mmu_notifier_range range;
++	int err;
++
++	if (!old_pb->canaries_installed || new_pb->end <= new_pb->start)
++		return 0;
++	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_VMA, 0, NULL,
++				old_pb->mm, new_pb->start, new_pb->end);
++	mmu_notifier_invalidate_range_start(&range);
++	err = walk_page_range(old_pb->mm, new_pb->start, new_pb->end,
++			      &pet_mremap_restore_walk_ops, &ctx);
++	mmu_notifier_invalidate_range_end(&range);
++	if (err)
++		return err;
++	return ctx.changed;
++}
++
++static long pet_update_canary_protection_locked(struct pet_pblock *pb,
++						bool protect)
++{
++	struct pet_protect_ctx ctx = {
++		.pb = pb,
++		.protect = protect,
++	};
++	struct mmu_notifier_range range;
++	int err;
++
++	if (!pb->canaries_installed)
++		return 0;
++	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_VMA, 0, NULL,
++				pb->mm, pb->start, pb->end);
++	mmu_notifier_invalidate_range_start(&range);
++	err = walk_page_range(pb->mm, pb->start, pb->end,
++			      &pet_canary_protect_walk_ops, &ctx);
++	mmu_notifier_invalidate_range_end(&range);
++	if (err)
++		return err;
++	return ctx.changed;
++}
++
++static long pet_update_canary_protection(struct pet_pblock *pb, bool protect)
++{
++	long changed;
++
++	if (!pb->canaries_installed)
++		return 0;
++	if (!mmap_read_trylock(pb->mm))
++		return -EAGAIN;
++	changed = pet_update_canary_protection_locked(pb, protect);
++	mmap_read_unlock(pb->mm);
++	return changed;
++}
++
++static void pet_note_poisoned(void)
++{
++	mutex_lock(&pet_lock);
++	WRITE_ONCE(pet_have_poisoned, true);
++	mutex_unlock(&pet_lock);
++}
++
++static int pet_install_canaries(struct pet_pblock *pb)
++{
++	bool selected = false;
++	long changed;
++	long migrated;
++
++	if (pet_prepare_temp(pb))
++		return -ENOMEM;
++	if (!pb->canaries_installed) {
++		pb->canary_seed = get_random_u32();
++		bitmap_fill(pb->temp_canary_installed, pb->nr_temp);
++		pb->canaries_installed = true;
++		selected = true;
++	}
++	migrated = pet_migrate_range(pb->mm, pb->start, pb->end, true, pb, true);
++	if (migrated < 0)
++		goto fail;
++	changed = pet_update_canary_protection(pb, true);
++	if (changed < 0)
++		goto fail;
++	atomic64_add(changed, &pet_stats.canary_pages);
++	pet_note_poisoned();
++	return 0;
++
++fail:
++	if (selected) {
++		pb->canaries_installed = false;
++		if (pb->temp_canary_installed)
++			bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
++	}
++	return migrated < 0 ? migrated : changed;
++}
++
++static int pet_remove_canaries(struct pet_pblock *pb)
++{
++	long changed;
++
++	if (!pb->canaries_installed)
++		return 0;
++	changed = pet_update_canary_protection(pb, false);
++	if (changed < 0)
++		return changed;
++	pb->canaries_installed = false;
++	if (pb->temp_canary_installed)
++		bitmap_zero(pb->temp_canary_installed, pb->nr_temp);
++	return 0;
++}
++
++static bool pet_sample_addr(struct mm_struct *mm, unsigned long addr)
++{
++	struct pet_sample_ctx ctx = {};
++
++	if (addr >= TASK_SIZE)
++		return false;
++	if (walk_page_range(mm, addr, addr + PAGE_SIZE,
++			    &pet_sample_walk_ops, &ctx))
++		return false;
++	atomic64_inc(&pet_stats.sampled_pages);
++	return ctx.present && ctx.accessed;
++}
++
++/*
++ * Two-phase sampling (paper §4.2, Fig. 6): the accessed bit of a page
++ * armed at interval N is only meaningful at interval N+1, because we
++ * cleared it when arming.  A bare test-and-clear of a fresh random page
++ * would report accesses accumulated since the bit was last cleared by
++ * anyone (often: since the page was faulted in), which systematically
++ * overestimates hotness.
++ */
++static void pet_sample_pblock(struct pet_pblock *pb)
++{
++	struct mm_struct *mm = pb->mm;
++	unsigned long temp;
++	unsigned long armed;
++	unsigned int checks = 0;
++	unsigned int i;
++
++	if (!mmap_read_trylock(mm))
++		return;
++
++	if (pb->state == PET_NORMAL) {
++		armed = pb->sample_addr;
++		if (armed >= pb->start && armed < pb->end) {
++			if (pet_sample_addr(mm, armed))
++				pb->sampled_accessed = true;
++			checks++;
++		}
++		armed = pet_random_page_addr(pb->start, pb->end);
++		pet_sample_addr(mm, armed);
++		pb->sample_addr = armed;
++		goto out;
++	}
++
++	if (pb->state == PET_PHASE2 || pb->state == PET_DEMOTED)
++		goto out;
++
++	if (pet_prepare_temp(pb))
++		goto out;
++
++	temp = pet_temp_bytes();
++	for (i = 0; i < pb->nr_temp; i++) {
++		unsigned long start = pb->start + i * temp;
++		unsigned long end = min(start + temp, pb->end);
++
++		if (start >= end)
++			break;
++		armed = pb->temp_sample_addr[i];
++		if (armed >= start && armed < end) {
++			if (pet_sample_addr(mm, armed)) {
++				pb->sampled_accessed = true;
++				__set_bit(i, pb->temp_accessed);
++			}
++			checks++;
++		}
++		armed = pet_random_page_addr(start, end);
++		pet_sample_addr(mm, armed);
++		pb->temp_sample_addr[i] = armed;
++		cond_resched();
++	}
++
++out:
++	mmap_read_unlock(mm);
++	pb->samples_seen += checks;
++}
++
++static int pet_choose_target_node(struct page *page, bool demote)
++{
++	int nid, best = NUMA_NO_NODE;
++	int best_dist = INT_MAX;
++
++	if (demote) {
++		if (READ_ONCE(pet_slow_node) != NUMA_NO_NODE)
++			return READ_ONCE(pet_slow_node);
++		return next_demotion_node(page_to_nid(page));
++	}
++
++	if (READ_ONCE(pet_fast_node) != NUMA_NO_NODE)
++		return READ_ONCE(pet_fast_node);
++
++	for_each_node_state(nid, N_MEMORY) {
++		int dist;
++
++		if (!node_is_toptier(nid))
++			continue;
++		dist = node_distance(page_to_nid(page), nid);
++		if (dist < best_dist) {
++			best_dist = dist;
++			best = nid;
++		}
++	}
++	return best;
++}
++
++struct pet_migrate_ctx {
++	struct list_head pages;
++	struct pet_pblock *pb;
++	bool demote;
++	bool canary_only;
++	unsigned long queued;
++};
++
++static int pet_migrate_pte_entry(pte_t *pte, unsigned long addr,
++				 unsigned long next, struct mm_walk *walk)
++{
++	struct pet_migrate_ctx *ctx = walk->private;
++	struct vm_area_struct *vma = walk->vma;
++	struct page *page;
++	unsigned long nr_pages = 1;
++	int target;
++
++	if (!pte_present(*pte) || !vma_migratable(vma))
++		return 0;
++
++	page = vm_normal_page(vma, addr, *pte);
++	if (!page || is_zone_device_page(page) || PageReserved(page))
++		return 0;
++
++	if (PageTransCompound(page)) {
++		if (ctx->canary_only)
++			return 0;
++		/*
++		 * PTE-mapped compound folio: isolate the whole folio.
++		 * For tail pages isolate_lru_page() fails once the folio
++		 * is already isolated, so revisits are harmless.
++		 */
++		page = compound_head(page);
++		nr_pages = thp_nr_pages(page);
++	} else if (ctx->canary_only && !pet_addr_is_canary(ctx->pb, addr)) {
++		return 0;
++	}
++
++	target = pet_choose_target_node(page, ctx->demote);
++	if (target == NUMA_NO_NODE || target == page_to_nid(page))
++		return 0;
++	if (!get_page_unless_zero(page))
++		return 0;
++
++	if (!isolate_lru_page(page)) {
++		list_add_tail(&page->lru, &ctx->pages);
++		mod_node_page_state(page_pgdat(page),
++				    NR_ISOLATED_ANON + page_is_file_lru(page),
++				    nr_pages);
++		ctx->queued += nr_pages;
++	}
++	put_page(page);
++	return 0;
++}
++
++/*
++ * Migrate PMD-mapped THPs as whole folios instead of letting the pte
++ * walk split their mappings; migrate_pages() handles huge migration
++ * entries (or splits the folio itself when THP migration is not
++ * supported).  Canary-only passes skip THPs: canaries are 4KB pages.
++ */
++static int pet_migrate_pmd_entry(pmd_t *pmd, unsigned long addr,
++				 unsigned long next, struct mm_walk *walk)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	struct pet_migrate_ctx *ctx = walk->private;
++	struct vm_area_struct *vma = walk->vma;
++	spinlock_t *ptl;
++	struct page *page;
++	unsigned int nr_pages;
++	int target;
++
++	ptl = pmd_trans_huge_lock(pmd, vma);
++	if (!ptl)
++		return 0;
++	walk->action = ACTION_CONTINUE;
++	if (ctx->canary_only)
++		goto out;
++	if (!pmd_present(*pmd) || is_huge_zero_pmd(*pmd) ||
++	    !vma_migratable(vma))
++		goto out;
++	page = pmd_page(*pmd);
++	if (is_zone_device_page(page) || PageReserved(page))
++		goto out;
++	target = pet_choose_target_node(page, ctx->demote);
++	if (target == NUMA_NO_NODE || target == page_to_nid(page))
++		goto out;
++	if (!get_page_unless_zero(page))
++		goto out;
++	nr_pages = thp_nr_pages(page);
++	if (!isolate_lru_page(page)) {
++		list_add_tail(&page->lru, &ctx->pages);
++		mod_node_page_state(page_pgdat(page),
++				    NR_ISOLATED_ANON + page_is_file_lru(page),
++				    nr_pages);
++		ctx->queued += nr_pages;
++	}
++	put_page(page);
++out:
++	spin_unlock(ptl);
++#endif
++	return 0;
++}
++
++static const struct mm_walk_ops pet_migrate_walk_ops = {
++	.pmd_entry = pet_migrate_pmd_entry,
++	.pte_entry = pet_migrate_pte_entry,
++};
++
++struct pet_alloc_ctx {
++	bool demote;
++};
++
++static struct page *pet_alloc_target_page(struct page *page,
++					  unsigned long private)
++{
++	struct pet_alloc_ctx *ctx = (struct pet_alloc_ctx *)private;
++	struct migration_target_control mtc = {
++		.gfp_mask = (GFP_HIGHUSER_MOVABLE | __GFP_THISNODE |
++			     __GFP_NOWARN | __GFP_NORETRY |
++			     __GFP_NOMEMALLOC) & ~__GFP_RECLAIM,
++		.nmask = NULL,
++	};
++
++	mtc.nid = pet_choose_target_node(page, ctx->demote);
++	if (mtc.nid == NUMA_NO_NODE)
++		return NULL;
++	return alloc_migration_target(page, (unsigned long)&mtc);
++}
++
++static long pet_migrate_range(struct mm_struct *mm, unsigned long start,
++			      unsigned long end, bool demote,
++			      struct pet_pblock *pb, bool canary_only)
++{
++	struct pet_migrate_ctx walk = {
++		.pb = pb,
++		.demote = demote,
++		.canary_only = canary_only,
++	};
++	struct pet_alloc_ctx alloc = {
++		.demote = demote,
++	};
++	unsigned int nr_succeeded = 0;
++	int err;
++
++	if (end <= start)
++		return 0;
++
++	INIT_LIST_HEAD(&walk.pages);
++	if (!mmap_read_trylock(mm))
++		return -EAGAIN;
++	err = walk_page_range(mm, start, end, &pet_migrate_walk_ops, &walk);
++	mmap_read_unlock(mm);
++	if (err) {
++		if (!list_empty(&walk.pages))
++			putback_movable_pages(&walk.pages);
++		return err;
++	}
++
++	if (list_empty(&walk.pages))
++		return 0;
++
++	err = migrate_pages(&walk.pages, pet_alloc_target_page, NULL,
++			    (unsigned long)&alloc, MIGRATE_ASYNC,
++			    demote ? MR_DEMOTION : MR_SYSCALL,
++			    &nr_succeeded);
++	if (err)
++		putback_movable_pages(&walk.pages);
++	if (nr_succeeded) {
++		if (demote)
++			atomic64_add(nr_succeeded, &pet_stats.demoted_pages);
++		else
++			atomic64_add(nr_succeeded, &pet_stats.promoted_pages);
++	}
++	if (err) {
++		atomic64_inc(&pet_stats.migration_failures);
++		return err < 0 ? err : -EAGAIN;
++	}
++	return nr_succeeded;
++}
++
++static struct pet_pblock *pet_find_pblock(struct mm_struct *mm,
++					  unsigned long addr)
++{
++	struct pet_pblock *pb;
++
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (!READ_ONCE(pb->dying) && pb->mm == mm &&
++		    addr >= pb->start && addr < pb->end)
++			return pb;
++	}
++	return NULL;
++}
++
++static struct pet_pblock *pet_find_get_pblock_locked(struct mm_struct *mm,
++						     unsigned long addr)
++{
++	struct pet_pblock *pb = pet_find_pblock(mm, addr);
++
++	if (!pb || !pet_get_pblock_locked(pb))
++		return NULL;
++	return pb;
++}
++
++static struct pet_pblock *pet_get_next_pblock_after_locked(u64 *cursor,
++							   u64 max_id)
++{
++	struct pet_pblock *pb, *best = NULL;
++	u64 best_id = ~0ULL;
++
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (READ_ONCE(pb->dying))
++			continue;
++		if (pb->id > max_id || pb->id <= *cursor || pb->id >= best_id)
++			continue;
++		best = pb;
++		best_id = pb->id;
++	}
++	if (!best)
++		return NULL;
++	if (!pet_get_pblock_locked(best))
++		return NULL;
++	*cursor = best->id;
++	return best;
++}
++
++static bool pet_lock_live_pblock(struct pet_pblock *pb)
++{
++	mutex_lock(&pb->lock);
++	if (READ_ONCE(pb->dying)) {
++		mutex_unlock(&pb->lock);
++		return false;
++	}
++	return true;
++}
++
++static struct pet_pblock *pet_get_next_pblock(u64 *cursor, u64 max_id)
++{
++	struct pet_pblock *pb;
++
++	mutex_lock(&pet_lock);
++	pb = pet_get_next_pblock_after_locked(cursor, max_id);
++	mutex_unlock(&pet_lock);
++	return pb;
++}
++
++static unsigned long pet_demoted_bytes_locked(void)
++{
++	struct pet_pblock *pb;
++	unsigned long bytes = 0;
++
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (!READ_ONCE(pb->dying) && READ_ONCE(pb->state) == PET_DEMOTED)
++			bytes += pet_pblock_bytes(pb);
++	}
++	return bytes;
++}
++
++static unsigned long pet_pblock_threshold_locked(struct pet_pblock *pb)
++{
++	unsigned long th_total = pet_promotion_total_threshold();
++	unsigned long demoted = pet_demoted_bytes_locked();
++
++	if (!demoted)
++		return th_total;
++	return max_t(unsigned long,
++		     DIV_ROUND_UP(th_total * pet_pblock_bytes(pb), demoted),
++		     1);
++}
++
++static void pet_queue_promotion_locked(struct pet_pblock *pb)
++{
++	if (READ_ONCE(pb->dying) || pb->promote_pending ||
++	    READ_ONCE(pb->state) != PET_DEMOTED)
++		return;
++	pb->promote_pending = true;
++	list_add_tail(&pb->promote_list, &pet_promote_list);
++	wake_up_interruptible(&pet_promote_wait);
++}
++
++static void pet_queue_accessed_demoted_locked(struct pet_pblock *locked)
++{
++	struct pet_pblock *pb;
++
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (pb == locked) {
++			pet_sync_fault_window_locked(pb);
++			if (pb->state == PET_DEMOTED && pb->fault_count)
++				pet_queue_promotion_locked(pb);
++			continue;
++		}
++		if (!mutex_trylock(&pb->lock)) {
++			if (!READ_ONCE(pb->dying) &&
++			    READ_ONCE(pb->state) == PET_DEMOTED &&
++			    READ_ONCE(pb->fault_window) ==
++			    pet_current_fault_window() &&
++			    READ_ONCE(pb->fault_count))
++				pet_queue_promotion_locked(pb);
++			continue;
++		}
++		pet_sync_fault_window_locked(pb);
++		if (!READ_ONCE(pb->dying) && pb->state == PET_DEMOTED &&
++		    pb->fault_count)
++			pet_queue_promotion_locked(pb);
++		mutex_unlock(&pb->lock);
++	}
++}
++
++static bool pet_restore_canary_fault_pte(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct mmu_notifier_range range;
++	pte_t old_pte, new_pte;
++	bool was_writable;
++	bool handled = false;
++
++	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0, vma,
++				vma->vm_mm, vmf->address,
++				vmf->address + PAGE_SIZE);
++	mmu_notifier_invalidate_range_start(&range);
++	vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
++	spin_lock(vmf->ptl);
++	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
++		handled = true;
++		goto out;
++	}
++	if (!pte_present(vmf->orig_pte) || !pte_protnone(vmf->orig_pte))
++		goto out;
++
++	old_pte = ptep_get(vmf->pte);
++	was_writable = pte_write(old_pte) || pte_savedwrite(old_pte);
++	new_pte = pte_modify(old_pte, vma->vm_page_prot);
++	new_pte = pte_mkyoung(new_pte);
++	if (was_writable)
++		new_pte = pte_mkwrite(new_pte);
++	ptep_modify_prot_commit(vma, vmf->address, vmf->pte,
++				old_pte, new_pte);
++	update_mmu_cache(vma, vmf->address, vmf->pte);
++	handled = true;
++out:
++	pte_unmap_unlock(vmf->pte, vmf->ptl);
++	mmu_notifier_invalidate_range_end(&range);
++	return handled;
++}
++
++bool pet_handle_protnone_fault(struct vm_fault *vmf)
++{
++	struct pet_pblock *pb;
++	unsigned int temp_idx;
++	bool handled;
++
++	if (!READ_ONCE(pet_enabled))
++		return false;
++	/*
++	 * No P-block has PROT_NONE canaries: leave the fault to NUMA
++	 * balancing without touching pet_lock.  The flag is only lowered
++	 * by the authoritative rescan; a stale false right after canary
++	 * installation at worst loses that one count, and the canary is
++	 * re-poisoned on the next refresh tick.
++	 */
++	if (!READ_ONCE(pet_have_poisoned))
++		return false;
++
++	mutex_lock(&pet_lock);
++	pb = pet_find_get_pblock_locked(vmf->vma->vm_mm, vmf->address);
++	mutex_unlock(&pet_lock);
++	if (!pb)
++		return false;
++	if (!pet_lock_live_pblock(pb)) {
++		pet_put_pblock(pb);
++		return false;
++	}
++	if ((pb->state != PET_PHASE2 && pb->state != PET_DEMOTED) ||
++	    !pet_addr_is_canary(pb, vmf->address)) {
++		mutex_unlock(&pb->lock);
++		pet_put_pblock(pb);
++		return false;
++	}
++
++	handled = pet_restore_canary_fault_pte(vmf);
++	if (handled && !READ_ONCE(pb->dying)) {
++		temp_idx = pet_temp_index(pb, vmf->address);
++		if (pb->temp_accessed && temp_idx < pb->nr_temp)
++			__set_bit(temp_idx, pb->temp_accessed);
++		pb->sampled_accessed = true;
++		pet_sync_fault_window_locked(pb);
++		pb->fault_count++;
++		atomic64_inc(&pet_stats.fake_faults);
++
++		mutex_lock(&pet_lock);
++		pet_interval_faults++;
++		if (pb->state == PET_DEMOTED) {
++			if (pet_interval_faults >= pet_promotion_total_threshold())
++				pet_queue_accessed_demoted_locked(pb);
++			else if (pb->fault_count >=
++				 pet_pblock_threshold_locked(pb))
++				pet_queue_promotion_locked(pb);
++		}
++		mutex_unlock(&pet_lock);
++	}
++	mutex_unlock(&pb->lock);
++	pet_put_pblock(pb);
++	return handled;
++}
++
++static bool pet_file_trackable(struct file *file)
++{
++	struct inode *inode;
++
++	if (!file)
++		return false;
++	if (file->f_mode & FMODE_PATH)
++		return false;
++	inode = file_inode(file);
++	if (!inode || !S_ISREG(inode->i_mode))
++		return false;
++	if (IS_DAX(inode))
++		return false;
++	return true;
++}
++
++static bool pet_file_eligible(struct file *file)
++{
++	return READ_ONCE(pet_file_demote_enabled) && pet_file_trackable(file);
++}
++
++static void pet_queue_cold_inode_locked(struct inode *inode, bool ref_held)
++{
++	if (inode->i_pet_cold_queued || inode->i_pet_cold_processing)
++		return;
++	if (!ref_held)
++		ihold(inode);
++	inode->i_pet_cold_queued = true;
++	inode->i_pet_cold_jiffies = jiffies;
++	list_add_tail(&inode->i_pet_cold_list, &pet_cold_files);
++	atomic64_inc(&pet_stats.file_inodes_queued);
++}
++
++void pet_file_opened(struct file *file)
++{
++	struct inode *inode;
++	bool drop_ref = false;
++
++	if (!pet_file_trackable(file))
++		return;
++
++	inode = file_inode(file);
++	spin_lock(&pet_cold_lock);
++	if (!file->f_pet_counted) {
++		file->f_pet_counted = true;
++		atomic_inc(&inode->i_pet_open_count);
++		inode->i_pet_cold_gen++;
++	}
++	if (inode->i_pet_cold_queued) {
++		list_del_init(&inode->i_pet_cold_list);
++		inode->i_pet_cold_queued = false;
++		drop_ref = true;
++	}
++	spin_unlock(&pet_cold_lock);
++	if (drop_ref)
++		iput(inode);
++}
++
++void pet_file_closed(struct file *file)
++{
++	struct inode *inode;
++
++	if (!file->f_pet_counted)
++		return;
++	file->f_pet_counted = false;
++	inode = file_inode(file);
++
++	spin_lock(&pet_cold_lock);
++	if (atomic_dec_and_test(&inode->i_pet_open_count) &&
++	    READ_ONCE(pet_enabled) && pet_file_eligible(file) &&
++	    !inode->i_pet_cold_queued && !inode->i_pet_cold_processing)
++		pet_queue_cold_inode_locked(inode, false);
++	spin_unlock(&pet_cold_lock);
++}
++
++static long pet_migrate_file_inode(struct inode *inode, bool demote)
++{
++	struct address_space *mapping = inode->i_mapping;
++	struct pet_alloc_ctx alloc = {
++		.demote = demote,
++	};
++	struct folio_batch fbatch;
++	LIST_HEAD(pages);
++	pgoff_t index = 0;
++	unsigned int nr_succeeded = 0;
++	unsigned int i;
++	int err;
++
++	if (!mapping || mapping_empty(mapping))
++		return 0;
++
++	folio_batch_init(&fbatch);
++	while (filemap_get_folios(mapping, &index, (pgoff_t)-1, &fbatch)) {
++		for (i = 0; i < folio_batch_count(&fbatch); i++) {
++			struct folio *folio = fbatch.folios[i];
++
++			if (folio_test_dirty(folio) ||
++			    folio_test_writeback(folio) ||
++			    folio_test_unevictable(folio))
++				continue;
++			if (folio_isolate_lru(folio))
++				continue;
++			list_add_tail(&folio->lru, &pages);
++			node_stat_mod_folio(folio,
++					    NR_ISOLATED_ANON +
++					    folio_is_file_lru(folio),
++					    folio_nr_pages(folio));
++		}
++		folio_batch_release(&fbatch);
++		cond_resched();
++	}
++
++	if (list_empty(&pages))
++		return 0;
++
++	err = migrate_pages(&pages, pet_alloc_target_page, NULL,
++			    (unsigned long)&alloc, MIGRATE_ASYNC,
++			    demote ? MR_DEMOTION : MR_SYSCALL, &nr_succeeded);
++	if (err)
++		putback_movable_pages(&pages);
++	if (nr_succeeded) {
++		if (demote)
++			atomic64_add(nr_succeeded, &pet_stats.file_pages_demoted);
++		else
++			atomic64_add(nr_succeeded, &pet_stats.promoted_pages);
++	}
++	if (err) {
++		atomic64_inc(&pet_stats.migration_failures);
++		return err < 0 ? err : -EAGAIN;
++	}
++	return nr_succeeded;
++}
++
++/* Guarded by pet_cold_lock: inodes detached onto private drop lists. */
++static unsigned int pet_cold_detached;
++
++/*
++ * Detach @inode from the cold list onto a private @drop list.  Keeping
++ * i_pet_cold_processing set while the inode is on a private list stops
++ * pet_file_closed() from re-linking i_pet_cold_list, and the detached
++ * count keeps the reference visible to pet_sb_shutdown().
++ */
++static void pet_detach_cold_inode_locked(struct inode *inode,
++					 struct list_head *drop)
++{
++	inode->i_pet_cold_queued = false;
++	inode->i_pet_cold_processing = true;
++	list_move_tail(&inode->i_pet_cold_list, drop);
++	pet_cold_detached++;
++}
++
++static void pet_put_inode_list(struct list_head *drop)
++{
++	struct inode *inode;
++
++	while (!list_empty(drop)) {
++		inode = list_first_entry(drop, struct inode,
++					 i_pet_cold_list);
++		spin_lock(&pet_cold_lock);
++		list_del_init(&inode->i_pet_cold_list);
++		inode->i_pet_cold_processing = false;
++		pet_cold_detached--;
++		spin_unlock(&pet_cold_lock);
++		iput(inode);
++	}
++}
++
++/*
++ * Pull the next demotion candidate off the cold list and park it on
++ * pet_processing_files so pet_sb_shutdown() can see in-flight inodes.
++ * Entries whose file was reopened are moved to @drop; the caller must
++ * pet_put_inode_list() them after releasing pet_cold_lock.
++ */
++static struct inode *pet_get_cold_inode(unsigned long min_age,
++					unsigned long *gen,
++					struct list_head *drop)
++{
++	struct inode *inode, *tmp, *found = NULL;
++
++	spin_lock(&pet_cold_lock);
++	list_for_each_entry_safe(inode, tmp, &pet_cold_files,
++				 i_pet_cold_list) {
++		if (atomic_read(&inode->i_pet_open_count) > 0) {
++			pet_detach_cold_inode_locked(inode, drop);
++			continue;
++		}
++		if (time_before(jiffies, inode->i_pet_cold_jiffies + min_age))
++			continue;
++		inode->i_pet_cold_queued = false;
++		inode->i_pet_cold_processing = true;
++		list_move_tail(&inode->i_pet_cold_list,
++			       &pet_processing_files);
++		*gen = inode->i_pet_cold_gen;
++		found = inode;
++		break;
++	}
++	spin_unlock(&pet_cold_lock);
++	return found;
++}
++
++static void pet_process_cold_files(void)
++{
++	unsigned long min_age = msecs_to_jiffies(max_t(unsigned int,
++						READ_ONCE(pet_scan_interval_ms), 1));
++	struct inode *inode;
++
++	for (;;) {
++		LIST_HEAD(drop);
++		long migrated;
++		unsigned long gen;
++		bool closed_now;
++		bool promote_back = false;
++		bool raced;
++		bool requeue = false;
++
++		inode = pet_get_cold_inode(min_age, &gen, &drop);
++		pet_put_inode_list(&drop);
++		if (!inode)
++			return;
++
++		migrated = pet_migrate_file_inode(inode, true);
++
++		spin_lock(&pet_cold_lock);
++		closed_now = atomic_read(&inode->i_pet_open_count) == 0 &&
++			     READ_ONCE(pet_enabled) &&
++			     READ_ONCE(pet_file_demote_enabled);
++		raced = inode->i_pet_cold_gen != gen || !closed_now;
++		if (migrated > 0 && raced)
++			promote_back = true;
++		if (closed_now && (migrated < 0 || raced))
++			requeue = true;
++		spin_unlock(&pet_cold_lock);
++
++		/*
++		 * Keep the inode on pet_processing_files across the
++		 * promote-back migration so pet_sb_shutdown() can see the
++		 * reference we still hold.
++		 */
++		if (promote_back)
++			pet_migrate_file_inode(inode, false);
++
++		spin_lock(&pet_cold_lock);
++		list_del_init(&inode->i_pet_cold_list);
++		inode->i_pet_cold_processing = false;
++		if (requeue)
++			pet_queue_cold_inode_locked(inode, false);
++		/* Account our reference as detached until the iput below. */
++		pet_cold_detached++;
++		spin_unlock(&pet_cold_lock);
++		iput(inode);
++		spin_lock(&pet_cold_lock);
++		pet_cold_detached--;
++		spin_unlock(&pet_cold_lock);
++		cond_resched();
++	}
++}
++
++/*
++ * Called from generic_shutdown_super() before evict_inodes().  The cold
++ * list holds inode references; without this drain those references make
++ * umount report busy inodes and the deferred iput() would then hit a
++ * freed superblock.
++ */
++void pet_sb_shutdown(struct super_block *sb)
++{
++	struct inode *inode, *tmp;
++
++	for (;;) {
++		LIST_HEAD(drop);
++		bool busy = false;
++
++		spin_lock(&pet_cold_lock);
++		list_for_each_entry_safe(inode, tmp, &pet_cold_files,
++					 i_pet_cold_list) {
++			if (inode->i_sb == sb)
++				pet_detach_cold_inode_locked(inode, &drop);
++		}
++		list_for_each_entry(inode, &pet_processing_files,
++				    i_pet_cold_list) {
++			if (inode->i_sb == sb) {
++				busy = true;
++				break;
++			}
++		}
++		if (pet_cold_detached)
++			busy = true;
++		spin_unlock(&pet_cold_lock);
++
++		pet_put_inode_list(&drop);
++		if (!busy)
++			return;
++		msleep(20);
++	}
++}
++
++static struct pet_pblock *pet_new_split(struct pet_pblock *src,
++					unsigned long start,
++					unsigned long end,
++					enum pet_pblock_state state)
++{
++	struct pet_pblock *pb;
++
++	pb = kzalloc(sizeof(*pb), GFP_KERNEL);
++	if (!pb)
++		return NULL;
++	pet_init_pblock(pb);
++	pb->mm = src->mm;
++	pb->start = start;
++	pb->end = end;
++	pb->state = state;
++	pb->id = atomic64_inc_return(&pet_next_id);
++	pb->canary_seed = get_random_u32();
++	atomic64_inc(&pet_stats.captured_pblocks);
++	return pb;
++}
++
++static void pet_free_pblock_list(struct list_head *head)
++{
++	struct pet_pblock *pb, *tmp;
++
++	list_for_each_entry_safe(pb, tmp, head, list)
++		pet_free_pblock(pb);
++}
++
++static int pet_emit_split_run(struct pet_pblock *src,
++			      struct list_head *new_blocks,
++			      unsigned long start, unsigned long end, bool hot)
++{
++	struct pet_pblock *pb;
++	long migrated;
++
++	pb = pet_new_split(src, start, end, hot ? PET_NORMAL : PET_DEMOTED);
++	if (!pb)
++		return -ENOMEM;
++	list_add_tail(&pb->list, new_blocks);
++
++	if (hot)
++		migrated = pet_migrate_range(src->mm, start, end, false, src,
++					     true);
++	else
++		migrated = pet_migrate_range(src->mm, start, end, true, NULL,
++					     false);
++	if (migrated < 0) {
++		pet_free_pblock(pb);
++		return migrated;
++	}
++	return 0;
++}
++
++static void pet_split_phase2_pblock(struct pet_pblock *pb)
++{
++	LIST_HEAD(new_blocks);
++	unsigned long temp = pet_temp_bytes();
++	unsigned long run_start = pb->start;
++	unsigned long run_end = pb->start;
++	bool run_hot = false;
++	bool have_run = false;
++	bool installed = false;
++	struct pet_pblock *new;
++	unsigned int i;
++
++	for (i = 0; i < pb->nr_temp; i++) {
++		unsigned long start = pb->start + i * temp;
++		unsigned long end = min(start + temp, pb->end);
++		bool hot;
++
++		if (start >= end)
++			break;
++		hot = test_bit(i, pb->temp_accessed);
++		if (!have_run) {
++			run_start = start;
++			run_end = end;
++			run_hot = hot;
++			have_run = true;
++			continue;
++		}
++		if (hot == run_hot && start == run_end) {
++			run_end = end;
++			continue;
++		}
++		if (pet_emit_split_run(pb, &new_blocks, run_start, run_end,
++				       run_hot))
++			goto fail;
++		run_start = start;
++		run_end = end;
++		run_hot = hot;
++	}
++
++	if (have_run) {
++		if (pet_emit_split_run(pb, &new_blocks, run_start, run_end,
++				       run_hot))
++			goto fail;
++	}
++
++	if (pet_remove_canaries(pb))
++		goto fail;
++
++	list_for_each_entry(new, &new_blocks, list) {
++		if (new->state != PET_DEMOTED)
++			continue;
++		if (pet_install_canaries(new)) {
++			pet_migrate_range(new->mm, new->start, new->end,
++					  false, NULL, false);
++			new->state = PET_NORMAL;
++			pet_reset_tracking(new);
++		}
++	}
++
++	mutex_lock(&pet_lock);
++	if (!READ_ONCE(pb->dying) && !list_empty(&pb->list)) {
++		list_splice_init(&new_blocks, &pb->list);
++		pet_free_pblock(pb);
++		installed = true;
++	}
++	mutex_unlock(&pet_lock);
++	if (!installed)
++		pet_free_pblock_list(&new_blocks);
++	return;
++
++fail:
++	pet_free_pblock_list(&new_blocks);
++}
++
++static void pet_demote_single_phase2_pblock(struct pet_pblock *pb)
++{
++	long migrated;
++	long protected;
++
++	migrated = pet_migrate_range(pb->mm, pb->start, pb->end, true, NULL,
++				     false);
++	protected = pet_update_canary_protection(pb, true);
++	if (migrated < 0 || protected < 0)
++		return;
++
++	pb->state = PET_DEMOTED;
++	pet_reset_tracking(pb);
++}
++
++static void pet_restore_phase2_pblock(struct pet_pblock *pb)
++{
++	long migrated;
++
++	migrated = pet_migrate_range(pb->mm, pb->start, pb->end, false, pb,
++				     true);
++	if (migrated < 0 || pet_remove_canaries(pb))
++		return;
++
++	pb->state = PET_NORMAL;
++	pet_reset_tracking(pb);
++}
++
++static void pet_finish_pblock_scan(struct pet_pblock *pb)
++{
++	unsigned int hot = 0, cold = 0;
++
++	if (READ_ONCE(pb->dying))
++		return;
++
++	switch (pb->state) {
++	case PET_NORMAL:
++		/*
++		 * Only treat the block as cold if at least one armed page
++		 * was actually checked this scan; mmap_lock contention can
++		 * otherwise starve sampling and fake a cold signal.
++		 */
++		if (!pb->sampled_accessed && pb->samples_seen) {
++			if (!pet_prepare_temp(pb))
++				pb->state = PET_PHASE1;
++		}
++		pet_reset_tracking(pb);
++		break;
++	case PET_PHASE1:
++		if (!pb->samples_seen) {
++			pet_reset_tracking(pb);
++			break;
++		}
++		if (!pet_prepare_temp(pb)) {
++			hot = bitmap_weight(pb->temp_accessed, pb->nr_temp);
++			cold = pb->nr_temp - hot;
++			if (cold > hot) {
++				pet_reset_tracking(pb);
++				if (!pet_install_canaries(pb))
++					pb->state = PET_PHASE2;
++				break;
++			}
++			pb->state = PET_NORMAL;
++		}
++		pet_reset_tracking(pb);
++		break;
++	case PET_PHASE2:
++		if (pet_prepare_temp(pb)) {
++			/*
++			 * Fall back to NORMAL only once the canaries are
++			 * gone; otherwise stay in PHASE2 and retry next
++			 * scan so no untracked PROT_NONE PTEs linger.
++			 */
++			if (!pet_remove_canaries(pb))
++				pb->state = PET_NORMAL;
++			break;
++		}
++		hot = bitmap_weight(pb->temp_accessed, pb->nr_temp);
++		cold = pb->nr_temp - hot;
++		if (cold > hot) {
++			if (pb->nr_temp <= 1)
++				pet_demote_single_phase2_pblock(pb);
++			else
++				pet_split_phase2_pblock(pb);
++		} else {
++			pet_restore_phase2_pblock(pb);
++		}
++		break;
++	case PET_DEMOTED:
++		pet_reset_tracking(pb);
++		break;
++	default:
++		break;
++	}
++}
++
++static void pet_update_have_poisoned(void)
++{
++	struct pet_pblock *pb;
++	bool poisoned = false;
++
++	mutex_lock(&pet_lock);
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		if (!READ_ONCE(pb->dying) &&
++		    READ_ONCE(pb->canaries_installed)) {
++			poisoned = true;
++			break;
++		}
++	}
++	WRITE_ONCE(pet_have_poisoned, poisoned);
++	mutex_unlock(&pet_lock);
++}
++
++static void pet_finish_scan(void)
++{
++	struct pet_pblock *pb;
++	u64 cursor = 0;
++	u64 max_id = atomic64_read(&pet_next_id);
++
++	while ((pb = pet_get_next_pblock(&cursor, max_id))) {
++		if (pet_lock_live_pblock(pb)) {
++			pet_finish_pblock_scan(pb);
++			mutex_unlock(&pb->lock);
++		}
++		pet_put_pblock(pb);
++		cond_resched();
++	}
++	pet_update_have_poisoned();
++	if (READ_ONCE(pet_file_demote_enabled))
++		pet_process_cold_files();
++}
++
++static void pet_refresh_canaries(void)
++{
++	struct pet_pblock *pb;
++	u64 cursor = 0;
++	u64 max_id = atomic64_read(&pet_next_id);
++
++	while ((pb = pet_get_next_pblock(&cursor, max_id))) {
++		if (pet_lock_live_pblock(pb)) {
++			if (pb->state == PET_PHASE2 || pb->state == PET_DEMOTED)
++				pet_update_canary_protection(pb, true);
++			mutex_unlock(&pb->lock);
++		}
++		pet_put_pblock(pb);
++		cond_resched();
++	}
++}
++
++static void pet_sample_pblocks(void)
++{
++	struct pet_pblock *pb;
++	u64 cursor = 0;
++	u64 max_id = atomic64_read(&pet_next_id);
++
++	while ((pb = pet_get_next_pblock(&cursor, max_id))) {
++		if (pet_lock_live_pblock(pb)) {
++			pet_sample_pblock(pb);
++			mutex_unlock(&pb->lock);
++		}
++		pet_put_pblock(pb);
++		cond_resched();
++	}
++}
++
++static void pet_reset_promotion_window(void)
++{
++	mutex_lock(&pet_lock);
++	pet_interval_faults = 0;
++	pet_advance_fault_window_locked();
++	mutex_unlock(&pet_lock);
++}
++
++static int pet_demote_thread_fn(void *unused)
++{
++	unsigned int ticks = 0;
++
++	while (!kthread_should_stop()) {
++		unsigned int sleep_ms = max_t(unsigned int,
++					      READ_ONCE(pet_sampling_interval_ms),
++					      1);
++
++		if (!READ_ONCE(pet_enabled)) {
++			msleep_interruptible(sleep_ms);
++			continue;
++		}
++
++		pet_sample_pblocks();
++		pet_refresh_canaries();
++
++		ticks++;
++		if (ticks >= pet_samples_per_scan()) {
++			pet_finish_scan();
++			ticks = 0;
++		}
++		pet_reset_promotion_window();
++
++		msleep_interruptible(sleep_ms);
++	}
++	return 0;
++}
++
++static int pet_promote_thread_fn(void *unused)
++{
++	while (!kthread_should_stop()) {
++		wait_event_interruptible(pet_promote_wait,
++					 kthread_should_stop() ||
++					 !list_empty_careful(&pet_promote_list));
++		if (kthread_should_stop())
++			break;
++
++		for (;;) {
++			struct pet_pblock *pb;
++			long migrated;
++
++			mutex_lock(&pet_lock);
++			if (list_empty(&pet_promote_list)) {
++				mutex_unlock(&pet_lock);
++				break;
++			}
++			pb = list_first_entry(&pet_promote_list,
++					      struct pet_pblock,
++					      promote_list);
++			list_del_init(&pb->promote_list);
++			pb->promote_pending = false;
++			if (!pet_get_pblock_locked(pb)) {
++				mutex_unlock(&pet_lock);
++				continue;
++			}
++			mutex_unlock(&pet_lock);
++
++			if (!pet_lock_live_pblock(pb)) {
++				pet_put_pblock(pb);
++				continue;
++			}
++			if (pb->state != PET_DEMOTED)
++				goto out;
++
++			migrated = pet_migrate_range(pb->mm, pb->start, pb->end,
++						     false, NULL, false);
++			if (migrated < 0)
++				goto out;
++			if (pet_remove_canaries(pb))
++				goto out;
++			pb->state = PET_NORMAL;
++			pet_reset_tracking(pb);
++			atomic64_inc(&pet_stats.promoted_pblocks);
++out:
++			mutex_unlock(&pb->lock);
++			pet_put_pblock(pb);
++			cond_resched();
++		}
++	}
++	return 0;
++}
++
++static void pet_clear_cold_files(void)
++{
++	struct inode *inode, *tmp;
++	LIST_HEAD(drop);
++
++	spin_lock(&pet_cold_lock);
++	list_for_each_entry_safe(inode, tmp, &pet_cold_files,
++				 i_pet_cold_list)
++		pet_detach_cold_inode_locked(inode, &drop);
++	spin_unlock(&pet_cold_lock);
++	pet_put_inode_list(&drop);
++}
++
++static ssize_t pet_enabled_read(struct file *file, char __user *buf,
++				size_t len, loff_t *ppos)
++{
++	char tmp[4];
++	int n = scnprintf(tmp, sizeof(tmp), "%u\n",
++			  READ_ONCE(pet_enabled) ? 1 : 0);
++
++	return simple_read_from_buffer(buf, len, ppos, tmp, n);
++}
++
++static ssize_t pet_enabled_write(struct file *file, const char __user *buf,
++				 size_t len, loff_t *ppos)
++{
++	char tmp[16];
++	bool value;
++
++	if (len >= sizeof(tmp))
++		return -EINVAL;
++	if (copy_from_user(tmp, buf, len))
++		return -EFAULT;
++	tmp[len] = '\0';
++	if (kstrtobool(tmp, &value))
++		return -EINVAL;
++	pet_apply_enabled(value);
++	return len;
++}
++
++static const struct proc_ops pet_enabled_ops = {
++	.proc_read = pet_enabled_read,
++	.proc_write = pet_enabled_write,
++	.proc_lseek = noop_llseek,
++};
++
++static int pet_stats_show(struct seq_file *m, void *v)
++{
++	unsigned long counts[PET_NR_STATES] = {};
++	struct pet_pblock *pb;
++
++	mutex_lock(&pet_lock);
++	list_for_each_entry(pb, &pet_pblocks, list) {
++		enum pet_pblock_state state = READ_ONCE(pb->state);
++
++		if (state < PET_NR_STATES)
++			counts[state]++;
++	}
++
++	seq_printf(m, "enabled=%u\n", READ_ONCE(pet_enabled) ? 1 : 0);
++	seq_printf(m, "file_demote_enabled=%u\n",
++		   READ_ONCE(pet_file_demote_enabled) ? 1 : 0);
++	seq_printf(m, "min_mmap_kb=%u\n", READ_ONCE(pet_min_mmap_kb));
++	seq_printf(m, "max_pblock_mb=%u\n", READ_ONCE(pet_max_pblock_mb));
++	seq_printf(m, "temp_block_mb=%u\n", READ_ONCE(pet_temp_block_mb));
++	seq_printf(m, "canary_ratio=%u\n", READ_ONCE(pet_canary_ratio));
++	seq_printf(m, "sampling_interval_ms=%u\n",
++		   READ_ONCE(pet_sampling_interval_ms));
++	seq_printf(m, "scan_interval_ms=%u\n",
++		   READ_ONCE(pet_scan_interval_ms));
++	seq_printf(m, "promo_faults_per_sec=%u\n",
++		   READ_ONCE(pet_promo_faults_per_sec));
++	seq_printf(m, "promotion_total_threshold=%lu\n",
++		   pet_promotion_total_threshold());
++	seq_printf(m, "fast_node=%d\n", READ_ONCE(pet_fast_node));
++	seq_printf(m, "slow_node=%d\n", READ_ONCE(pet_slow_node));
++	seq_printf(m, "pblocks_normal=%lu\n", counts[PET_NORMAL]);
++	seq_printf(m, "pblocks_phase1=%lu\n", counts[PET_PHASE1]);
++	seq_printf(m, "pblocks_phase2=%lu\n", counts[PET_PHASE2]);
++	seq_printf(m, "pblocks_demoted=%lu\n", counts[PET_DEMOTED]);
++	seq_printf(m, "captured_pblocks=%lld\n",
++		   atomic64_read(&pet_stats.captured_pblocks));
++	seq_printf(m, "released_pblocks=%lld\n",
++		   atomic64_read(&pet_stats.released_pblocks));
++	seq_printf(m, "sampled_pages=%lld\n",
++		   atomic64_read(&pet_stats.sampled_pages));
++	seq_printf(m, "demoted_pages=%lld\n",
++		   atomic64_read(&pet_stats.demoted_pages));
++	seq_printf(m, "promoted_pages=%lld\n",
++		   atomic64_read(&pet_stats.promoted_pages));
++	seq_printf(m, "canary_pages=%lld\n",
++		   atomic64_read(&pet_stats.canary_pages));
++	seq_printf(m, "fake_faults=%lld\n",
++		   atomic64_read(&pet_stats.fake_faults));
++	seq_printf(m, "promoted_pblocks=%lld\n",
++		   atomic64_read(&pet_stats.promoted_pblocks));
++	seq_printf(m, "file_pages_demoted=%lld\n",
++		   atomic64_read(&pet_stats.file_pages_demoted));
++	seq_printf(m, "file_inodes_queued=%lld\n",
++		   atomic64_read(&pet_stats.file_inodes_queued));
++	seq_printf(m, "migration_failures=%lld\n",
++		   atomic64_read(&pet_stats.migration_failures));
++	mutex_unlock(&pet_lock);
++	return 0;
++}
++
++static int pet_stats_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, pet_stats_show, NULL);
++}
++
++static const struct proc_ops pet_stats_ops = {
++	.proc_open = pet_stats_open,
++	.proc_read = seq_read,
++	.proc_lseek = seq_lseek,
++	.proc_release = single_release,
++};
++
++static int __init pet_init(void)
++{
++	pet_demote_task = kthread_run(pet_demote_thread_fn, NULL, "kdemoted");
++	if (IS_ERR(pet_demote_task))
++		return PTR_ERR(pet_demote_task);
++	pet_promote_task = kthread_run(pet_promote_thread_fn, NULL, "kpromoted");
++	if (IS_ERR(pet_promote_task)) {
++		int err = PTR_ERR(pet_promote_task);
++
++		kthread_stop(pet_demote_task);
++		return err;
++	}
++
++	pet_proc_dir = proc_mkdir(PET_PROC_DIR, NULL);
++	if (!pet_proc_dir)
++		return 0;
++	proc_create(PET_PROC_ENABLED, 0644, pet_proc_dir, &pet_enabled_ops);
++	proc_create(PET_PROC_STATS, 0444, pet_proc_dir, &pet_stats_ops);
++	pr_info("PET tiering prototype initialized; enable via /proc/pet/enabled\n");
++	return 0;
++}
++late_initcall(pet_init);
