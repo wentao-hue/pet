@@ -62,6 +62,15 @@ forever).  Before experiments set `kernel.numa_balancing=0`, and see
   promotion back to the fast node → a second automatic demotion cycle
   after the workload goes idle again; zero migration failures, zero
   kernel warnings.
+- Lifecycle/concurrency stress smoke (`init-stress` + `churn.c`): ~2400
+  mmap/mremap/munmap/partial-unmap ops with periodic fork (children
+  touch inherited canary PROT_NONE PTEs) and repeated runtime
+  enable/disable toggles — captured == released (no P-block leaks) with
+  demotion/canary/fake-fault/promotion active throughout; ext4 on
+  virtio-blk exercises cold-file demotion of a closed 64 MiB file, and
+  an immediate umount right after queueing a fresh inode drains cleanly
+  (no "Busy inodes", validating the superblock-shutdown path at
+  runtime).
 - Paper-level performance numbers still require a bare-metal tiered-memory
   host (DRAM + slow tier with a demotion path); nothing here fabricates
   results.

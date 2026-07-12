@@ -70,6 +70,7 @@
 | hot-set microbenchmark smoke test | passed |
 | MMU_NOTIFIER=n 下 `mm/pet.o` | passed（KVM/DRM 全关,验证 `mmu_notifier_clear_young` 的 `#ifdef` 包裹） |
 | QEMU 双 NUMA 节点功能冒烟(`scripts/qemu_smoke/`) | passed: 256MB anon P-block 捕获 → 两阶段判冷 → PHASE1/PHASE2(canary ~10% 预降级+PROT_NONE)→ 全量降级到 node1(65536 页,含 split/merge 路径)→ 空闲期稳定、零误促升 → re-touch 触发 42 次 fake fault → th_block 阈值促升整块回 node0(promoted_pblocks=2)→ 再次空闲后自动完成第二轮全量降级;全程 migration_failures=0,无内核 WARNING/BUG/Oops |
+| QEMU 生命周期/并发压力冒烟(`scripts/qemu_smoke/init-stress` + `churn.c`) | passed: ~2400 次 mmap/mremap/munmap/尾半 unmap 扰动 + ~37 次 fork(子进程触碰含 canary PROT_NONE 的继承页表)+ 运行中 4 次 enable/disable 翻转,captured=released=148 无块泄漏,期间 demote/canary/fake-fault(3611 次)/promote 全部照常工作;ext4(virtio-blk)上 64MB 文件关闭后整体降级(file_pages_demoted=16384);文件刚入队立刻 umount → UMOUNT OK、全程无 "Busy inodes"(pet_sb_shutdown 排干路径的运行时验证);migration_failures=0,无内核告警 |
 | full `vmlinux` | passed（docker concord-kbuild 交叉编译，defconfig+PET_TIERING+THP，`-d NETFILTER_XT_TARGET_TCPMSS` 因 macOS 大小写不敏感文件系统，与历史构建一致） |
 
 ## 剩余工程风险

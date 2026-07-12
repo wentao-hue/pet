@@ -1,0 +1,48 @@
+#!/bin/sh
+# PET stress smoke: lifecycle churn + enable/disable toggling + real-fs
+# cold-file demotion + umount drain.
+export PATH=/bin
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+echo "=== BOOT OK ==="
+echo 1 > /proc/pet/enabled
+
+echo "=== PHASE A: churn + toggle ==="
+/churn 24 &
+CHURN=$!
+t=0
+while [ $t -lt 4 ]; do
+  sleep 3
+  echo 0 > /proc/pet/enabled
+  sleep 1
+  echo 1 > /proc/pet/enabled
+  t=$((t+1))
+  echo "--- toggle $t done, stats:"
+  grep -E 'pblocks_|captured|released|demoted_pages|promoted_pages|fake_faults|migration_failures' /proc/pet/stats
+done
+wait $CHURN
+sleep 3
+echo "=== PHASE A stats ==="
+cat /proc/pet/stats
+
+echo "=== PHASE B: ext4 cold-file demotion ==="
+mkdir -p /mnt
+mount -t ext4 /dev/vda /mnt || echo "MOUNT FAILED"
+dd if=/dev/zero of=/mnt/coldfile bs=1M count=64 2>/dev/null
+sync
+sleep 6
+echo "--- after cold wait:"
+grep -E 'file_pages_demoted|file_inodes_queued|migration_failures' /proc/pet/stats
+
+echo "=== PHASE C: umount drain race ==="
+dd if=/dev/zero of=/mnt/lastfile bs=1M count=16 2>/dev/null
+sync
+umount /mnt && echo "UMOUNT OK"
+grep -E 'file_pages_demoted|file_inodes_queued' /proc/pet/stats
+
+echo "=== FINAL FULL STATS ==="
+cat /proc/pet/stats
+echo "=== SMOKE DONE ==="
+poweroff -f
