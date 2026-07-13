@@ -71,9 +71,16 @@ forever).  Before experiments set `kernel.numa_balancing=0`, and see
   an immediate umount right after queueing a fresh inode drains cleanly
   (no "Busy inodes", validating the superblock-shutdown path at
   runtime).
-- Paper-level performance numbers still require a bare-metal tiered-memory
-  host (DRAM + slow tier with a demotion path); nothing here fabricates
-  results.
+- Bare-metal bring-up done: the monolithic PET kernel boots a two-socket
+  AMD EPYC host (node 1 = emulated slow tier), and an 8 GiB anonymous
+  workload reproduces the full bidirectional cycle end to end — demotion
+  to the slow node when the block goes cold, then promotion back to the
+  fast node (driven by fake faults on canary PTEs) when it is re-accessed,
+  both matching the workload size byte-for-byte with zero migration
+  failures. See `pet_repro/INSTALL-baremetal.md`.
+- Paper-level performance numbers (fast-memory savings / slowdown vs. the
+  paper's Optane tier) still require a full benchmark matrix on a genuine
+  slow-tier host; nothing here fabricates results.
 
 ## License
 
